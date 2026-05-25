@@ -2,6 +2,13 @@ import { Profile, ActivityLevel } from "./types";
 
 export type Targets = { calories: number; protein: number; carbs: number; fat: number };
 
+// Absolute hard minimum daily calorie floor for adult women, applied ON TOP of
+// the Mifflin-St Jeor BMR floor. 1200 kcal is the conventional, widely-cited
+// minimum daily intake for adult women; it is deliberately conservative (small,
+// sedentary women on a fat-loss goal can have a Mifflin BMR of ~1150-1240, which
+// the BMR floor alone would allow). Adjustable if the safety model changes.
+export const MIN_DAILY_CALORIES = 1200;
+
 // --- Tolerant unit parsing (deterministic: same input always -> same output) ---
 
 // iOS auto-converts ' and " to curly quotes; normalize them back so 5'6" parses.
@@ -88,7 +95,8 @@ export function computeTargets(p: Profile): Targets | null {
     default:
       calories = tdee; // feel_better, maintain
   }
-  calories = Math.max(calories, bmr); // safety floor: never below BMR
+  // Safety floor: never below BMR, and never below the absolute 1200 kcal minimum.
+  calories = Math.max(calories, bmr, MIN_DAILY_CALORIES);
 
   const proteinPerKg = p.goal === "build_muscle" || p.goal === "tone_up" ? 2.0 : 1.8;
   const protein = proteinPerKg * kg;

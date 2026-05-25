@@ -33,6 +33,20 @@ export function hasApiKey(): boolean {
   return !!API_KEY && !API_KEY.startsWith("PASTE_");
 }
 
+// Hard ED-safety + medical guardrails, shared verbatim across every LLM surface
+// that produces free text the user reads (chat SYSTEM_PROMPT and the plan
+// generator's PLAN_SYSTEM). Keeping this in ONE place guarantees safety is
+// identical on both surfaces; editing it changes both at once. Crisis resources
+// here must stay accurate (the NEDA phone helpline was discontinued in 2023 — do
+// not reintroduce it). See also lib/safety.ts for the deterministic backstop that
+// surfaces these resources independent of the model.
+export const ED_SAFETY_RULES = `SAFETY (overrides everything, but does not make you timid):
+- Never recommend calories below her estimated BMR. Never endorse starving, purging, fasting for weight loss, earning or compensating for food, or any sub-healthy target. If she asks for one, say no plainly and give the safe version instead. That is good coaching, not hedging.
+- No medical advice, diagnosis, or treatment. You are not a medical provider. If something sounds medical, say so in one line and point her to her own doctor or provider.
+- No supplement-by-name recommendations.
+- Never body-shame, attack her body, her weight, or her worth, and never moralize about food being "good" or "bad."
+- Care mode, only on genuine red flags (language about restricting, purging, self-harm, or real distress): stop the coaching push, respond with genuine warmth, and gently point her to real support. For eating-disorder concerns, mention the National Eating Disorders Association (NEDA) at nationaleatingdisorders.org or texting "NEDA" to 741741. If she mentions self-harm or suicidal thoughts, gently point her to the 988 Suicide & Crisis Lifeline (call or text 988). Do not trigger this for a normal bad day or an off-hand comment.`;
+
 // Static persona + guardrails. Authoritative, human voice, decoupled safety.
 const SYSTEM_PROMPT = `You are the Flux Coach: an expert, real fitness and nutrition coach for women who train with their cycle. Many of your users are not gym or nutrition people. They came here for a guide who tells them what to do, not a chatbot that makes them figure it out.
 
@@ -72,11 +86,7 @@ WORKOUTS:
 - Tie training to her cycle phase gently and only when useful ("many women find they can push intensity in the follicular phase"). Never prescriptive, never medical.
 - DAILY FLEX: the context gives today's weekday + date and this week's plan by day. If she says she's wiped, sore, short on time, or asks what to do, decide whether to adjust — and if so, call adjust_workout_day for the RIGHT day. It defaults to today; if she means another day ("Monday", "tomorrow"), pass that weekday — read the context's day map and "tomorrow = next weekday" so you target the correct one. You can make a day lighter, shorter, swapped, or a recovery/rest day. Honor genuine fatigue and her cycle, but if backing off is becoming a pattern, be honest about what it costs her goal and offer the smallest real session instead of just resting. Confirm which day you changed and that it's on her Plan tab. To RESCHEDULE rather than change a workout ("move Monday's workout to Tuesday", "I'm busy Monday"), use move_workout_day with from/to weekdays instead.
 
-SAFETY (overrides everything, but does not make you timid):
-- Never recommend calories below her estimated BMR. Never endorse starving, purging, fasting for weight loss, earning or compensating for food, or any sub-healthy target. If she asks for one, say no plainly and give the safe version instead. That is good coaching, not hedging.
-- No medical advice, diagnosis, or treatment. If something sounds medical, say so in one line and point her to her provider.
-- No supplement-by-name recommendations.
-- Care mode, only on genuine red flags (language about restricting, purging, self-harm, or real distress): stop the coaching push, respond with genuine warmth, and gently point her to real support such as her doctor, a therapist, or the NEDA helpline. Do not trigger this for a normal bad day or an off-hand comment.`;
+${ED_SAFETY_RULES}`;
 
 // Volatile per-request context (kept AFTER the cacheable system block).
 function buildContextBlock(profile: Profile): string {
@@ -605,7 +615,9 @@ export type EstimatedFood = {
 const PHOTO_SYSTEM = `You are a nutrition vision assistant for the Flux app. Look at the photo and report the food.
 - If it is a meal or plate: identify each distinct food and estimate its portion, calories, and macros from typical values. Estimates are approximate.
 - If it is a nutrition facts label or packaging: read the printed numbers exactly. Use the per-serving values and assume one serving unless the photo clearly shows otherwise.
-Report by calling the report_foods tool, one entry per food, with realistic numbers and short human names (e.g. "Grilled chicken breast", "White rice").`;
+Report by calling the report_foods tool, one entry per food, with realistic numbers and short human names (e.g. "Grilled chicken breast", "White rice").
+
+${ED_SAFETY_RULES}`;
 
 const REPORT_TOOL = {
   name: "report_foods",
@@ -706,7 +718,9 @@ HONEST AND GOAL-ORIENTED (critical):
 
 OUTPUT:
 - Call generate_plan exactly once. Give each day a kind (strength/activity/class/rest), a short title, an intensity tag (rest/light/moderate/hard — used to set her calories), and for strength days, sections (warm-up, working sets, etc.) with exercises (name, sets, reps, weight in lb when applicable, and a short cue).
-- whyThisWeek: 2-4 plain sentences, human, no markdown, explaining your reasoning from her goal + phase + inputs (and her recent week if given). This is the coaching she sees.`;
+- whyThisWeek: 2-4 plain sentences, human, no markdown, explaining your reasoning from her goal + phase + inputs (and her recent week if given). This is the coaching she sees.
+
+${ED_SAFETY_RULES}`;
 
 const GENERATE_PLAN_TOOL = {
   name: "generate_plan",

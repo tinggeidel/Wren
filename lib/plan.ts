@@ -17,7 +17,7 @@ import {
   WEEKDAY_LABELS,
 } from "./types";
 import { toISODate, parseISO, addDays } from "./cycle";
-import { computeTargets, computeBMR } from "./targets";
+import { computeTargets, computeBMR, MIN_DAILY_CALORIES } from "./targets";
 import { consumedTotals } from "./food";
 import {
   estimateBurn,
@@ -127,9 +127,9 @@ export function planDayToWorkoutEntry(
 
 // --- Code-computed calorie cycling (used by Food/Coach in Stage C) ------------
 // Cycle the deterministic target around the day's intensity. Protein stays put;
-// the calorie difference moves through carbs. The hard BMR floor is re-applied
-// AFTER cycling (see dayTargets), so rest/light multipliers can never push the
-// daily calorie target below BMR.
+// the calorie difference moves through carbs. The hard floors (BMR and the
+// absolute 1200 kcal minimum) are re-applied AFTER cycling (see dayTargets), so
+// rest/light multipliers can never push the daily calorie target below them.
 const INTENSITY_FACTOR: Record<DayIntensity, number> = {
   rest: 0.9,
   light: 0.95,
@@ -204,10 +204,11 @@ export function dayTargets(profile: Profile, intensity: DayIntensity): Macros | 
   const base = computeTargets(profile);
   if (!base) return null;
   const f = INTENSITY_FACTOR[intensity] ?? 1;
-  // Re-apply the hard BMR floor: rest/light multipliers must never drop the
-  // daily target below BMR. Clamp before deriving carbs so macros stay consistent.
+  // Re-apply the hard floors: rest/light multipliers must never drop the daily
+  // target below the larger of BMR and the absolute 1200 kcal minimum. Clamp
+  // before deriving carbs so macros stay consistent with the clamped calories.
   const bmr = computeBMR(profile);
-  const floored = bmr != null ? Math.max(base.calories * f, bmr) : base.calories * f;
+  const floored = Math.max(base.calories * f, bmr ?? 0, MIN_DAILY_CALORIES);
   const calories = Math.round(floored / 10) * 10;
   const protein = base.protein;
   const fat = base.fat;

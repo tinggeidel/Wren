@@ -36,6 +36,7 @@ import {
   MoveDayArgs,
 } from "../lib/coach";
 import { weekdayKey } from "../lib/plan";
+import { detectCrisisLanguage, CRISIS_RESOURCES_MESSAGE } from "../lib/safety";
 import { loadChat, saveChat, clearChat, saveProfile } from "../lib/storage";
 import {
   makeEntry,
@@ -383,11 +384,22 @@ export default function CoachScreen({
     const next: ChatMessage[] = [...messagesRef.current, userMsg];
     appendMessages(next);
     setSending(true);
+    // Deterministic crisis backstop: if the user's own words contain unambiguous
+    // high-risk language, we ALWAYS surface support resources as an extra
+    // assistant message, regardless of what the model returns (the model still
+    // replies via care-mode; this is the guarantee it never gets missed). Decided
+    // from the user text here, appended below alongside the reply in a single
+    // save so it can't race the chat-append path.
+    const crisis = detectCrisisLanguage(userMsg.content);
+    const crisisMsg: ChatMessage[] = crisis
+      ? [{ role: "assistant", content: CRISIS_RESOURCES_MESSAGE, date: userMsg.date }]
+      : [];
     try {
       const reply = await askCoach(profileRef.current, next, runTool);
       const withReply: ChatMessage[] = [
         ...next,
         { role: "assistant", content: reply, date: userMsg.date },
+        ...crisisMsg,
       ];
       appendMessages(withReply);
       await saveChat(withReply);
@@ -400,6 +412,9 @@ export default function CoachScreen({
           content: `Something went wrong reaching the Coach: ${msg}. Check your API key and connection.`,
           date: userMsg.date,
         },
+        // Even if the Coach call fails, the deterministic support resources must
+        // still appear — that's exactly when the backstop matters most.
+        ...crisisMsg,
       ];
       appendMessages(withErr);
       await saveChat(withErr);
