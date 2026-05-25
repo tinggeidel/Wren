@@ -20,10 +20,12 @@ import {
   ACTIVITY_LABELS,
   CalorieMode,
   CALORIE_MODE_LABELS,
+  CoachMemory,
 } from "../lib/types";
 import { saveProfile } from "../lib/storage";
 import { toISODate } from "../lib/cycle";
 import { computeTargets } from "../lib/targets";
+import { removeMemory } from "../lib/memory";
 
 const GOALS: Goal[] = ["lose_fat", "tone_up", "build_muscle", "feel_better", "maintain"];
 const TONES: Tone[] = ["hype", "bestie", "tough_love"];
@@ -39,9 +41,13 @@ function parseDateOrToday(s: string): Date {
 export default function SettingsScreen({
   initial,
   onSaved,
+  onProfileChange,
 }: {
   initial: Profile | null;
   onSaved: (p: Profile) => void;
+  // Like CoachScreen's prop: updates the parent's profile WITHOUT switching tabs.
+  // Used by per-row memory deletes so they stay put on Settings.
+  onProfileChange?: (p: Profile) => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [goal, setGoal] = useState<Goal>(initial?.goal ?? "feel_better");
@@ -61,6 +67,11 @@ export default function SettingsScreen({
     initial?.activityLevel ?? "light"
   );
   const [calorieMode, setCalorieMode] = useState<CalorieMode>(initial?.calorieMode ?? "static");
+  // Long-term Coach memory is read from the live `initial` prop (not local state)
+  // so a fact the Coach saves while Settings is mounted isn't clobbered on Save,
+  // and so deletes/out-of-band additions both show correctly. The parent re-passes
+  // `initial` after each save, which re-renders the list below.
+  const coachMemory: CoachMemory[] = initial?.coachMemory ?? [];
   const [showPicker, setShowPicker] = useState(false);
 
   function buildProfile(): Profile {
@@ -86,6 +97,7 @@ export default function SettingsScreen({
       savedMeals: initial?.savedMeals ?? [], // preserve saved meals on save
       weightLog: initial?.weightLog ?? [], // preserve weight log on save
       plan: initial?.plan, // preserve the tailored plan on save
+      coachMemory: initial?.coachMemory ?? [], // preserve long-term Coach memory from the live prop (don't clobber out-of-band adds)
     };
   }
 
@@ -106,6 +118,19 @@ export default function SettingsScreen({
     const profile = buildProfile();
     await saveProfile(profile);
     onSaved(profile);
+  }
+
+  // Delete one remembered fact. Persists right away (so it sticks even if she
+  // leaves without tapping Save). It removes from the LAST-SAVED live profile
+  // (`initial`), not buildProfile(), so it does NOT commit any unsaved edits to
+  // other form fields. It updates the parent via onProfileChange (setProfile
+  // only, no tab change), so she stays on Settings and the list refreshes in
+  // place. (If a row is visible, `initial` exists; guard the theoretical null.)
+  async function handleForget(id: string) {
+    if (!initial) return;
+    const next = removeMemory(initial, id);
+    await saveProfile(next);
+    onProfileChange?.(next);
   }
 
   return (
@@ -296,6 +321,29 @@ export default function SettingsScreen({
         </>
       )}
 
+      <Text style={styles.section}>What your Coach remembers about you</Text>
+      {coachMemory.length === 0 ? (
+        <Text style={styles.hint}>
+          As you chat, your Coach will note lasting things about you here — like dietary
+          preferences or injuries. You can delete anything.
+        </Text>
+      ) : (
+        <View style={styles.memoryList}>
+          {coachMemory.map((m) => (
+            <View key={m.id} style={styles.memoryRow}>
+              <Text style={styles.memoryText}>{m.text}</Text>
+              <TouchableOpacity
+                style={styles.memoryDelete}
+                onPress={() => handleForget(m.id)}
+                accessibilityLabel={`Delete: ${m.text}`}
+              >
+                <Text style={styles.memoryDeleteText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          ))}
+        </View>
+      )}
+
       <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
         <Text style={styles.saveBtnText}>Save & go to Coach</Text>
       </TouchableOpacity>
@@ -347,6 +395,26 @@ const styles = StyleSheet.create({
   targetsHint: { fontSize: 13, color: "#666", marginTop: 8 },
   targetsMissing: { fontSize: 14, color: "#666", marginTop: 20, lineHeight: 20 },
   hint: { fontSize: 13, color: "#666", marginTop: 8, lineHeight: 18 },
+  memoryList: { marginTop: 12, gap: 8 },
+  memoryRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    backgroundColor: "#f0eef7",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  memoryText: { flex: 1, fontSize: 15, color: "#1a1a1a", lineHeight: 20 },
+  memoryDelete: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  memoryDeleteText: { fontSize: 16, color: "#7c3aed", fontWeight: "700" },
   switchRow: {
     flexDirection: "row",
     alignItems: "center",

@@ -112,6 +112,7 @@ export default function App() {
                     setProfile(p);
                     setTab("coach");
                   }}
+                  onProfileChange={setProfile}
                 />
               </View>
             </View>

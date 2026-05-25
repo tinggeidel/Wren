@@ -45,7 +45,14 @@ export type Profile = {
   calorieMode: CalorieMode;
   // Feature E: the tailored, rolling weekly plan (undefined until she sets one up).
   plan?: PlanState;
+  // Long-term Coach memory: durable facts about her (preferences, restrictions,
+  // injuries, access, life events, her "why") the Coach saves via a tool and that
+  // load into EVERY context — separate from, and cheaper than, the chat window.
+  coachMemory?: CoachMemory[];
 };
+
+// One durable fact the Coach remembers about the user. See lib/memory.ts.
+export type CoachMemory = { id: string; text: string; date: string }; // date = ISO date added
 
 export type CalorieMode = "static" | "net";
 

@@ -34,7 +34,10 @@ import {
   LogWorkoutArgs,
   AdjustDayArgs,
   MoveDayArgs,
+  RememberFactArgs,
+  ForgetFactArgs,
 } from "../lib/coach";
+import { addMemory, removeMemory } from "../lib/memory";
 import { weekdayKey } from "../lib/plan";
 import { detectCrisisLanguage, CRISIS_RESOURCES_MESSAGE } from "../lib/safety";
 import { loadChat, saveChat, clearChat, saveProfile } from "../lib/storage";
@@ -323,6 +326,44 @@ export default function CoachScreen({
       await saveProfile(updated);
       onProfileChange(updated);
       return `Moved ${WEEKDAY_LABELS[a.from]}'s "${from.title}" to ${WEEKDAY_LABELS[a.to]} (and swapped what was on ${WEEKDAY_LABELS[a.to]} back to ${WEEKDAY_LABELS[a.from]}).`;
+    }
+    if (name === "remember_fact") {
+      const a = input as RememberFactArgs;
+      const fact = (a.fact ?? "").trim();
+      if (!fact) return "Nothing to remember — no fact given.";
+      const updated = addMemory(profileRef.current, fact);
+      // addMemory is a no-op on a duplicate, so detect that to report honestly.
+      if (updated === profileRef.current) return `Already remembered "${fact}".`;
+      profileRef.current = updated;
+      await saveProfile(updated);
+      onProfileChange(updated);
+      return `Got it — I'll remember that: "${fact}". (Saved to long-term memory; she can view or delete it in Settings.)`;
+    }
+    if (name === "forget_fact") {
+      const a = input as ForgetFactArgs;
+      const q = (a.fact ?? "").trim().toLowerCase();
+      if (!q) return "Nothing to forget — no fact given.";
+      // Safe match: (1) prefer an exact (case-insensitive) hit; else (2) stored
+      // facts whose text CONTAINS the full query. We deliberately do NOT match the
+      // q.includes(t) direction: a long forget query that merely contains a short
+      // stored fact (e.g. "no dairy") could nuke a real restriction/allergy.
+      const items = profileRef.current.coachMemory ?? [];
+      const exact = items.find((m) => m.text.trim().toLowerCase() === q);
+      const candidates = exact
+        ? [exact]
+        : items.filter((m) => m.text.toLowerCase().includes(q));
+      // Only delete on an unambiguous single match. Zero or many -> remove nothing
+      // and tell the model so it can ask her to be specific.
+      if (candidates.length === 0)
+        return `I don't have a saved fact matching "${a.fact}", so nothing to forget.`;
+      if (candidates.length > 1)
+        return `I have a few saved facts that could match "${a.fact}", so I didn't remove anything. Ask her which one to forget.`;
+      const match = candidates[0];
+      const updated = removeMemory(profileRef.current, match.id);
+      profileRef.current = updated;
+      await saveProfile(updated);
+      onProfileChange(updated);
+      return `Done — I've forgotten "${match.text}".`;
     }
     return `Unknown tool ${name}.`;
   };

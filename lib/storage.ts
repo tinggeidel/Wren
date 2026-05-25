@@ -22,6 +22,7 @@ export async function loadProfile(): Promise<Profile | null> {
     if (!Array.isArray(p.savedFoods)) p.savedFoods = [];
     if (!Array.isArray(p.savedMeals)) p.savedMeals = [];
     if (!Array.isArray(p.weightLog)) p.weightLog = [];
+    if (!Array.isArray(p.coachMemory)) p.coachMemory = []; // long-term Coach memory
     if (p.calorieMode !== "net") p.calorieMode = "static"; // default to the safe mode
     // Migrate the earlier Feature-B periodLog array (bleed days only) into dayLogs.
     if (Array.isArray(p.periodLog)) {

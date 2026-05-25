@@ -16,6 +16,7 @@ import { computeTargets } from "./targets";
 import { consumedTotals, entriesFor, remaining, waterFor } from "./food";
 import { workoutsFor, workoutLabel, caloriesBurnedFor } from "./workouts";
 import { mondayOf, newId, targetForDate, planDayForDate } from "./plan";
+import { memoryLines } from "./memory";
 
 // --- Models ---
 // Haiku for routine chat (cheap), Sonnet for complex coaching + the opener.
@@ -85,6 +86,13 @@ WORKOUTS:
 - Only log what she actually told you — don't invent sets, weights, or durations. If a detail is missing and it matters, you may ask one short question, otherwise log what you have. Confirm briefly and don't double-log something already shown in today's workouts.
 - Tie training to her cycle phase gently and only when useful ("many women find they can push intensity in the follicular phase"). Never prescriptive, never medical.
 - DAILY FLEX: the context gives today's weekday + date and this week's plan by day. If she says she's wiped, sore, short on time, or asks what to do, decide whether to adjust — and if so, call adjust_workout_day for the RIGHT day. It defaults to today; if she means another day ("Monday", "tomorrow"), pass that weekday — read the context's day map and "tomorrow = next weekday" so you target the correct one. You can make a day lighter, shorter, swapped, or a recovery/rest day. Honor genuine fatigue and her cycle, but if backing off is becoming a pattern, be honest about what it costs her goal and offer the smallest real session instead of just resting. Confirm which day you changed and that it's on her Plan tab. To RESCHEDULE rather than change a workout ("move Monday's workout to Tuesday", "I'm busy Monday"), use move_workout_day with from/to weekdays instead.
+
+LONG-TERM MEMORY:
+- You have a small, durable memory of facts about her, shown in the context under "WHAT YOU REMEMBER ABOUT HER". It is separate from this conversation and always applies — use it to stay consistent and personal across days.
+- Use the remember_fact tool to save a lasting, useful fact she tells you: dietary restrictions or preferences, foods she likes or dislikes, injuries or physical limitations, equipment or training access, schedule constraints, life events, her goals and her "why," and what motivates her. Keep each fact short and factual, in your words (e.g. "no dairy", "bad left knee, avoid deep lunges", "trains at home with dumbbells and bands", "training for a wedding in October").
+- Do NOT save transient daily data — today's food, mood, energy, or workout are already tracked elsewhere — and do not save trivia or anything that won't matter next week.
+- Use the forget_fact tool when something changes or was wrong, so you can self-correct (e.g. she healed an injury, or stopped a restriction).
+- ED-SAFETY (critical): never store a specific goal weight or a calorie number as a target to pursue, and never store restrictive or compensatory intentions, or body-shaming self-talk, as facts to act on. The SAFETY rules below still govern everything; memory must never be used to encode, remember toward, or optimize for an unsafe goal.
 
 ${ED_SAFETY_RULES}`;
 
@@ -217,6 +225,7 @@ function buildContextBlock(profile: Profile): string {
     ...(burnLine ? [burnLine] : []),
     "To add a food, water, workout, or cycle check-in she mentions that is not already shown above, call the matching log tool (log_food / log_water / log_workout / log_checkin). The conversation may span days; a message starting with [YYYY-MM-DD] marks that day. Never invent consumed or remaining numbers beyond those given here.",
     `Her preferences/rules: ${profile.dietaryRules || "none specified"}`,
+    ...(memoryLines(profile) ? [memoryLines(profile)] : []),
     `Coaching tone to use: ${toneStyle}`,
     "What she has said/logged today is in the conversation below.",
   ].join("\n");
@@ -269,6 +278,8 @@ export type LogWorkoutArgs = {
   date?: string;
 };
 export type MoveDayArgs = { from: Weekday; to: Weekday };
+export type RememberFactArgs = { fact: string };
+export type ForgetFactArgs = { fact: string };
 export type AdjustDayArgs = {
   weekday?: Weekday; // which day to change; defaults to today
   kind?: "strength" | "activity" | "rest";
@@ -440,6 +451,30 @@ const FOOD_TOOLS = [
         },
       },
       required: ["from", "to"],
+    },
+  },
+  {
+    name: "remember_fact",
+    description:
+      "Save one durable, lasting fact about the user to long-term memory so you stay consistent and personal across days. Use for: dietary restrictions/preferences, foods she likes or dislikes, injuries or physical limitations, equipment/training access, schedule constraints, life events, her goals and her 'why,' and what motivates her. Keep the fact short and factual (e.g. 'no dairy', 'bad left knee, avoid deep lunges', 'training for a wedding in October'). Do NOT save transient daily data (today's food, mood, energy, workout — already tracked) or trivia. SAFETY: never store a specific goal weight or a calorie number to pursue, and never store restrictive, compensatory, or body-shaming intentions as facts to act on.",
+    input_schema: {
+      type: "object",
+      properties: {
+        fact: { type: "string", description: "The lasting fact to remember, short and factual." },
+      },
+      required: ["fact"],
+    },
+  },
+  {
+    name: "forget_fact",
+    description:
+      "Remove a fact from long-term memory when it changed or was wrong, so you can self-correct (e.g. she healed an injury or stopped a restriction). Pass text that matches the stored fact you want removed; the closest match is removed. No-op if nothing matches.",
+    input_schema: {
+      type: "object",
+      properties: {
+        fact: { type: "string", description: "Text matching the stored fact to forget." },
+      },
+      required: ["fact"],
     },
   },
 ];
@@ -818,6 +853,7 @@ function planContext(profile: Profile, setup: PlanSetup, opts: GenerateWeekOptio
     setup.classes ? `Classes she does: ${setup.classes}` : "",
     `Experience: ${setup.experience}`,
     setup.injuries ? `Injuries/limitations: ${setup.injuries}` : "No injuries reported.",
+    memoryLines(profile),
     `This is week ${opts.weekNumber ?? 1}.`,
     opts.recentSummary ? `Recent history (use this to adapt honestly): ${opts.recentSummary}` : "First week — no history yet; set sensible starting loads.",
     opts.tweak ? `She asked you to adjust this week: ${opts.tweak}. Honor it where reasonable, but keep it goal-oriented and safe.` : "",
