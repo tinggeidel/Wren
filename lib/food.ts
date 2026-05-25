@@ -9,8 +9,6 @@ import {
   Profile,
   FoodEntry,
   Macros,
-  MealType,
-  MEAL_ORDER,
   FoodSource,
   SavedFood,
   SavedMeal,
@@ -47,14 +45,6 @@ export function remaining(consumed: Macros, target: Macros): Macros {
   };
 }
 
-// Entries for a day grouped by meal, in meal order, empty meals dropped.
-export function mealsFor(p: Profile, date: string): { meal: MealType; items: FoodEntry[] }[] {
-  const all = entriesFor(p, date);
-  return MEAL_ORDER.map((meal) => ({ meal, items: all.filter((e) => e.meal === meal) })).filter(
-    (g) => g.items.length > 0
-  );
-}
-
 // Recently logged foods (most recent first, de-duped by name) for one-tap re-log.
 export function recentFoods(p: Profile, limit = 12): FoodEntry[] {
   const all = Object.values(p.foodLogs ?? {})
@@ -76,15 +66,6 @@ let idSeq = 0;
 export function newId(): string {
   idSeq += 1;
   return `${Date.now().toString(36)}-${idSeq.toString(36)}`;
-}
-
-// Best-guess meal from the time of day (editable in the UI / overridable by the Coach).
-export function guessMeal(now: Date = new Date()): MealType {
-  const h = now.getHours();
-  if (h < 11) return "breakfast";
-  if (h < 16) return "lunch";
-  if (h < 21) return "dinner";
-  return "snack";
 }
 
 // Build a complete FoodEntry from a partial (fills id/date/source/createdAt).

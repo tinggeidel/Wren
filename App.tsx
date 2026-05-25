@@ -47,10 +47,17 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("coach");
 
   useEffect(() => {
-    loadProfile().then((p) => {
-      setProfile(p);
-      setLoading(false);
-    });
+    loadProfile()
+      .then((p) => {
+        setProfile(p);
+        setLoading(false);
+      })
+      .catch(() => {
+        // Belt-and-suspenders: a rejection must never leave us stuck on the
+        // spinner. Fall through to first-run (profile null) so the app recovers.
+        setProfile(null);
+        setLoading(false);
+      });
   }, []);
 
   return (

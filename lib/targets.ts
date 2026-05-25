@@ -52,16 +52,25 @@ const ACTIVITY_FACTOR: Record<ActivityLevel, number> = {
   very_active: 1.725,
 };
 
-// Deterministic daily targets from the profile. Returns null if we don't have
-// enough to compute (the Coach then asks for age/height/weight). Mifflin-St Jeor
-// BMR -> TDEE -> goal adjustment, with a hard BMR floor for safety.
-export function computeTargets(p: Profile): Targets | null {
+// Mifflin-St Jeor BMR (female). Returns null if age/weight/height are missing or
+// unparseable. Exported so other modules (e.g. plan.ts calorie cycling) can
+// re-apply the hard BMR floor without duplicating the formula.
+export function computeBMR(p: Profile): number | null {
   const age = parseInt((p.age || "").match(/\d+/)?.[0] ?? "", 10);
   const kg = parseWeightKg(p.weight || "");
   const cm = parseHeightCm(p.height || "");
   if (!age || !kg || !cm) return null;
+  return 10 * kg + 6.25 * cm - 5 * age - 161; // female
+}
 
-  const bmr = 10 * kg + 6.25 * cm - 5 * age - 161; // female
+// Deterministic daily targets from the profile. Returns null if we don't have
+// enough to compute (the Coach then asks for age/height/weight). Mifflin-St Jeor
+// BMR -> TDEE -> goal adjustment, with a hard BMR floor for safety.
+export function computeTargets(p: Profile): Targets | null {
+  const kg = parseWeightKg(p.weight || "");
+  const bmr = computeBMR(p);
+  if (!kg || bmr == null) return null;
+
   const factor = ACTIVITY_FACTOR[p.activityLevel ?? "light"] ?? 1.375;
   const tdee = bmr * factor;
 

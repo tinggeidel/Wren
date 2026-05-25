@@ -8,25 +8,32 @@ const CHAT_KEY = "flux.chat";
 export async function loadProfile(): Promise<Profile | null> {
   const raw = await AsyncStorage.getItem(PROFILE_KEY);
   if (!raw) return null;
-  const p = JSON.parse(raw) as Profile & { periodLog?: string[] };
-  // Back-compat: ensure the check-in map exists.
-  if (!p.dayLogs || typeof p.dayLogs !== "object") p.dayLogs = {};
-  // Feature C: ensure the food/water/workout maps exist on older saved profiles.
-  if (!p.foodLogs || typeof p.foodLogs !== "object") p.foodLogs = {};
-  if (!p.waterLogs || typeof p.waterLogs !== "object") p.waterLogs = {};
-  if (!p.workoutLogs || typeof p.workoutLogs !== "object") p.workoutLogs = {};
-  if (!Array.isArray(p.savedFoods)) p.savedFoods = [];
-  if (!Array.isArray(p.savedMeals)) p.savedMeals = [];
-  if (!Array.isArray(p.weightLog)) p.weightLog = [];
-  if (p.calorieMode !== "net") p.calorieMode = "static"; // default to the safe mode
-  // Migrate the earlier Feature-B periodLog array (bleed days only) into dayLogs.
-  if (Array.isArray(p.periodLog)) {
-    for (const d of p.periodLog) {
-      if (d && !p.dayLogs[d]) p.dayLogs[d] = { date: d, flow: "medium" };
+  // A corrupt/truncated blob must not crash launch. On parse failure, treat it as
+  // first-run (return null → onboarding) rather than letting the throw bubble up
+  // and leave App.tsx stuck on its loading spinner. Mirrors loadChat below.
+  try {
+    const p = JSON.parse(raw) as Profile & { periodLog?: string[] };
+    // Back-compat: ensure the check-in map exists.
+    if (!p.dayLogs || typeof p.dayLogs !== "object") p.dayLogs = {};
+    // Feature C: ensure the food/water/workout maps exist on older saved profiles.
+    if (!p.foodLogs || typeof p.foodLogs !== "object") p.foodLogs = {};
+    if (!p.waterLogs || typeof p.waterLogs !== "object") p.waterLogs = {};
+    if (!p.workoutLogs || typeof p.workoutLogs !== "object") p.workoutLogs = {};
+    if (!Array.isArray(p.savedFoods)) p.savedFoods = [];
+    if (!Array.isArray(p.savedMeals)) p.savedMeals = [];
+    if (!Array.isArray(p.weightLog)) p.weightLog = [];
+    if (p.calorieMode !== "net") p.calorieMode = "static"; // default to the safe mode
+    // Migrate the earlier Feature-B periodLog array (bleed days only) into dayLogs.
+    if (Array.isArray(p.periodLog)) {
+      for (const d of p.periodLog) {
+        if (d && !p.dayLogs[d]) p.dayLogs[d] = { date: d, flow: "medium" };
+      }
+      delete p.periodLog;
     }
-    delete p.periodLog;
+    return p;
+  } catch {
+    return null;
   }
-  return p;
 }
 
 export async function saveProfile(p: Profile): Promise<void> {

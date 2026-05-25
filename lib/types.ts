@@ -135,17 +135,6 @@ export const ACTIVITY_LABELS: Record<ActivityLevel, string> = {
 
 // --- Feature C: food + water logging -----------------------------------------
 
-export type MealType = "breakfast" | "lunch" | "dinner" | "snack";
-
-export const MEAL_LABELS: Record<MealType, string> = {
-  breakfast: "Breakfast",
-  lunch: "Lunch",
-  dinner: "Dinner",
-  snack: "Snack",
-};
-
-export const MEAL_ORDER: MealType[] = ["breakfast", "lunch", "dinner", "snack"];
-
 // How an entry was logged. "coach" = Coach estimated it from chat; "photo" = from
 // a snapped meal/label photo; "saved" = a saved favorite; "meal" = part of a saved meal.
 export type FoodSource = "search" | "barcode" | "manual" | "coach" | "photo" | "saved" | "meal";
@@ -177,7 +166,6 @@ export type FoodEntry = {
   date: string; // "YYYY-MM-DD"
   name: string;
   brand?: string;
-  meal?: MealType; // legacy/optional — meal slots were removed from the UI
   calories: number; // for the logged quantity
   protein: number; // grams
   carbs: number; // grams
@@ -267,7 +255,6 @@ export type PlanExercise = {
   weight?: number; // lb; omit for bodyweight/band
   note?: string; // cue / progression note
   done?: boolean; // checked off this week
-  loggedEntryId?: string; // the WorkoutEntry created when this exercise was checked
 };
 
 export type PlanSection = { name: string; durationMin?: number; exercises: PlanExercise[] };

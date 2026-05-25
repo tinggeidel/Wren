@@ -17,7 +17,7 @@ import {
   WEEKDAY_LABELS,
 } from "./types";
 import { toISODate, parseISO, addDays } from "./cycle";
-import { computeTargets } from "./targets";
+import { computeTargets, computeBMR } from "./targets";
 import { consumedTotals } from "./food";
 import {
   estimateBurn,
@@ -57,22 +57,16 @@ export function dayExercises(day: PlanDay): PlanExercise[] {
   return (day.sections ?? []).flatMap((s) => s.exercises);
 }
 
-// A strength day is "all checked" when every exercise is done.
-export function dayAllChecked(day: PlanDay): boolean {
-  const ex = dayExercises(day);
-  return ex.length > 0 && ex.every((e) => e.done);
-}
-
 export function isTrainingDay(day: PlanDay): boolean {
   return day.kind !== "rest";
 }
 
-// A day counts as logged if the whole day was logged (activity/class) or ANY of
-// its exercises has been checked off (strength logs per-exercise now).
+// A day counts as logged when its WorkoutEntry exists. Strength days set this on
+// the day (see WorkoutScreen.syncStrengthLog) once any exercise is checked, so a
+// single day-level field is the one definition of "done".
 export function dayLogged(day: PlanDay): boolean {
   if (day.kind === "rest") return false;
-  if (day.loggedEntryId) return true;
-  return (day.sections ?? []).some((s) => s.exercises.some((e) => e.loggedEntryId));
+  return !!day.loggedEntryId;
 }
 
 export function weekProgress(week: WeekPlan): { done: number; total: number } {
@@ -133,8 +127,9 @@ export function planDayToWorkoutEntry(
 
 // --- Code-computed calorie cycling (used by Food/Coach in Stage C) ------------
 // Cycle the deterministic target around the day's intensity. Protein stays put;
-// the calorie difference moves through carbs. (BMR floor is enforced inside
-// computeTargets for the base; light/rest days never go below ~90% of it.)
+// the calorie difference moves through carbs. The hard BMR floor is re-applied
+// AFTER cycling (see dayTargets), so rest/light multipliers can never push the
+// daily calorie target below BMR.
 const INTENSITY_FACTOR: Record<DayIntensity, number> = {
   rest: 0.9,
   light: 0.95,
@@ -147,8 +142,8 @@ const INTENSITY_FACTOR: Record<DayIntensity, number> = {
 // building next week (so it adapts honestly and pushes back on repeated skips).
 export function weekReviewSummary(p: Profile, week: WeekPlan): string {
   const training = week.days.filter(isTrainingDay);
-  const done = training.filter((d) => d.loggedEntryId);
-  const skipped = training.filter((d) => !d.loggedEntryId);
+  const done = training.filter(dayLogged);
+  const skipped = training.filter((d) => !dayLogged(d));
   const parts: string[] = [];
   parts.push(
     `Last week ("${week.programName}", week ${week.weekNumber}): she completed ${done.length} of ${training.length} planned workouts.`
@@ -209,7 +204,11 @@ export function dayTargets(profile: Profile, intensity: DayIntensity): Macros | 
   const base = computeTargets(profile);
   if (!base) return null;
   const f = INTENSITY_FACTOR[intensity] ?? 1;
-  const calories = Math.round((base.calories * f) / 10) * 10;
+  // Re-apply the hard BMR floor: rest/light multipliers must never drop the
+  // daily target below BMR. Clamp before deriving carbs so macros stay consistent.
+  const bmr = computeBMR(profile);
+  const floored = bmr != null ? Math.max(base.calories * f, bmr) : base.calories * f;
+  const calories = Math.round(floored / 10) * 10;
   const protein = base.protein;
   const fat = base.fat;
   const carbs = Math.max(0, Math.round((calories - protein * 4 - fat * 9) / 4 / 5) * 5);

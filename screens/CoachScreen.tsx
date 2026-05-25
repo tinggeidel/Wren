@@ -91,6 +91,15 @@ export default function CoachScreen({
   const [scanning, setScanning] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
 
+  // Always-current view of `messages`, so append-and-persist paths can build on
+  // the latest list (not a stale render closure) before calling saveChat. Mirrors
+  // the profileRef pattern below. Updated via appendMessages on every change.
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const appendMessages = (next: ChatMessage[]) => {
+    messagesRef.current = next;
+    setMessages(next);
+  };
+
   // Latest profile, available synchronously inside the tool loop (where several
   // log_food calls may land in one turn before React re-renders).
   const profileRef = useRef(profile);
@@ -299,7 +308,7 @@ export default function CoachScreen({
         loggedEntryId: undefined,
         sections: src.sections?.map((s) => ({
           ...s,
-          exercises: s.exercises.map((e) => ({ ...e, done: undefined, loggedEntryId: undefined })),
+          exercises: s.exercises.map((e) => ({ ...e, done: undefined })),
         })),
       });
       const days = cur.days.map((d) =>
@@ -323,7 +332,7 @@ export default function CoachScreen({
     let active = true;
     loadChat().then(async (store) => {
       if (!active) return;
-      setMessages(store.messages);
+      appendMessages(store.messages);
       const isNewDay = store.lastDate !== toISODate(new Date());
       const needKickoff = store.messages.length === 0 || isNewDay;
       if (!needKickoff) {
@@ -342,7 +351,7 @@ export default function CoachScreen({
           ...store.messages,
           { role: "assistant", content: reply, date: toISODate(new Date()) },
         ];
-        setMessages(appended);
+        appendMessages(appended);
         await saveChat(appended);
       } catch {
         // leave existing messages; she can still type
@@ -369,8 +378,10 @@ export default function CoachScreen({
   // or read a photo via tools), and persist.
   async function deliver(userMsg: ChatMessage) {
     if (sending || booting) return;
-    const next: ChatMessage[] = [...messages, userMsg];
-    setMessages(next);
+    // Build on the latest list via the ref, and write through appendMessages so
+    // messagesRef stays current for any append-and-save path (scan/clear/kickoff).
+    const next: ChatMessage[] = [...messagesRef.current, userMsg];
+    appendMessages(next);
     setSending(true);
     try {
       const reply = await askCoach(profileRef.current, next, runTool);
@@ -378,7 +389,7 @@ export default function CoachScreen({
         ...next,
         { role: "assistant", content: reply, date: userMsg.date },
       ];
-      setMessages(withReply);
+      appendMessages(withReply);
       await saveChat(withReply);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -390,7 +401,7 @@ export default function CoachScreen({
           date: userMsg.date,
         },
       ];
-      setMessages(withErr);
+      appendMessages(withErr);
       await saveChat(withErr);
     } finally {
       setSending(false);
@@ -419,6 +430,9 @@ export default function CoachScreen({
   // label numbers (and respond) — or say it isn't in the database.
   async function handleCoachScan(code: string) {
     setScanning(false);
+    // Don't run while a Coach turn is mid-flight — a multi-step deliver() could
+    // still be appending its reply, and we'd race/overwrite it on save.
+    if (sending || booting) return;
     let hit: FoodHit | null = null;
     try {
       hit = await lookupBarcode(code);
@@ -431,8 +445,10 @@ export default function CoachScreen({
         content: `I couldn't find barcode ${code} in the food database. Tell me what it was and I'll log it, or add it on the Food tab.`,
         date: toISODate(new Date()),
       };
-      const next = [...messages, note];
-      setMessages(next);
+      // Build on the latest list (ref), so a turn that resolved between the guard
+      // and here can't be clobbered when we persist.
+      const next: ChatMessage[] = [...messagesRef.current, note];
+      appendMessages(next);
       await saveChat(next);
       return;
     }
@@ -485,6 +501,9 @@ export default function CoachScreen({
   }
 
   function handleClear() {
+    // Same guard as the send/photo buttons: don't wipe history while a Coach
+    // turn is still resolving (its reply would land after the wipe).
+    if (sending || booting) return;
     Alert.alert(
       "Clear chat?",
       "This deletes your conversation history on this device. Your profile and targets stay.",
@@ -494,15 +513,18 @@ export default function CoachScreen({
           text: "Clear",
           style: "destructive",
           onPress: async () => {
+            // Re-check the guard: the alert is async, so a turn could have started
+            // (and be mid-flight) between tapping Clear and confirming it.
+            if (sending || booting) return;
             await clearChat();
-            setMessages([]);
+            appendMessages([]);
             setBooting(true);
             try {
               const reply = await coachKickoff(profile);
               const fresh: ChatMessage[] = [
                 { role: "assistant", content: reply, date: toISODate(new Date()) },
               ];
-              setMessages(fresh);
+              appendMessages(fresh);
               await saveChat(fresh);
             } catch {
               // ignore

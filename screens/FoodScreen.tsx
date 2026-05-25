@@ -1467,15 +1467,6 @@ const styles = StyleSheet.create({
   waterGoal: { fontSize: 13, fontWeight: "600", color: "#888" },
 
   empty: { color: "#666", fontSize: 15, lineHeight: 22, marginTop: 8 },
-  mealBlock: { marginBottom: 18 },
-  mealTitle: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: ACCENT,
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-    marginBottom: 8,
-  },
   entryRow: {
     flexDirection: "row",
     alignItems: "center",
