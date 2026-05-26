@@ -26,7 +26,7 @@ import {
 import { toISODate } from "../lib/cycle";
 import { addMemory } from "../lib/memory";
 import { toJpegBase64 } from "../lib/image";
-import { calibrateFromPhotos, hasApiKey } from "../lib/coach";
+import { calibrateFromPhotos, hasApiKey, CalibrationResult } from "../lib/coach";
 
 // Reuse the exact same option ordering Settings uses, so the two screens never
 // drift. These are the only fields onboarding collects; everything else on the
@@ -67,11 +67,27 @@ function ageFromBirthDate(birth: Date, now: Date): number {
 
 // Default birth date for the picker: ~30 years ago. We DON'T pre-fill the age
 // field from this — age stays blank until she actually confirms a date — so a
-// skipped Body step never stores a value she didn't pick.
+// skipped Body step never stores a value she didn't pick. We normalize to
+// midnight (start-of-day) so any picker-internal rounding still matches the
+// captured initial ref when we compare at day granularity.
 function defaultBirthDate(): Date {
   const d = new Date();
   d.setFullYear(d.getFullYear() - 30);
+  d.setHours(0, 0, 0, 0);
   return d;
+}
+
+// Day-granular date equality. The DOB gate uses this so the iOS spinner's
+// mount-time onChange (which can fire with a sub-second-rounded date) is not
+// treated as user intent. The only true signal that she picked a different
+// birth date is the calendar day changing — millisecond differences from
+// picker rounding must not silently commit the default ~30-yrs-ago age.
+function sameDay(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
 }
 // Oldest allowed birth date: 100 years ago, to keep ages sane. Newest is today.
 function minBirthDate(): Date {
@@ -227,10 +243,23 @@ export default function OnboardingScreen({
   // Birth-date picker state. We keep the picked Date in local state for the
   // calendar to display, but only write the COMPUTED whole-year age into the
   // existing string `age` field (the BMR math parses that). `age` stays "" until
-  // she confirms a date, so a skipped Body step never stores a default she didn't
-  // choose. `birthDate` is local-only — not persisted, not added to the Profile.
-  const [birthDate, setBirthDate] = useState<Date>(defaultBirthDate);
+  // she actually SPINS to a different date, so a skipped Body step (or a step
+  // where she only tapped to open the picker without spinning) never stores a
+  // default she didn't choose. `birthDate` is local-only — not persisted, not
+  // added to the Profile.
+  //
+  // `birthDateChanged` is the "did she actually spin to a different date?" flag.
+  // It flips true ONLY when an onChange fires with a date that differs from the
+  // initial default — opening the picker alone does NOT trip it. The belt-and-
+  // suspenders fallbacks in next()/finish() and the iOS "Done" button only fire
+  // when this is true, so a user who taps the DOB row but never spins stays at
+  // age="" and BMR stays null (Coach asks for stats later, no silent default).
+  // The initial-default Date is captured once via useRef so the comparison is
+  // stable across re-renders.
+  const initialBirthDateRef = useRef<Date>(defaultBirthDate());
+  const [birthDate, setBirthDate] = useState<Date>(initialBirthDateRef.current);
   const [showBirthPicker, setShowBirthPicker] = useState(false);
+  const [birthDateChanged, setBirthDateChanged] = useState(false);
 
   // Body steppers: live numeric values. Defaults show a friendly starting point
   // (5'6", 150 lb), but they only get written into height/weight once she
@@ -257,6 +286,17 @@ export default function OnboardingScreen({
   // Tracks the three facts seeded (if any) so we can show a brief confirm and so
   // re-running calibration replaces rather than stacks. Local-only; not persisted.
   const [calibratedFacts, setCalibratedFacts] = useState<string[]>([]);
+  // The structured calibration result, rendered in the confirmation card so the
+  // user can SEE that her photos produced something before we advance. Cleared
+  // back to null on retake/skip. Local-only; the three qualitative strings are
+  // seeded as durable memory via calibratedFacts at finish() time.
+  const [calibrationResult, setCalibrationResult] = useState<CalibrationResult | null>(null);
+  // Confirmation overlay flag: when true the photo step swaps to a small card
+  // showing the three qualitative strings, with auto-advance after a short
+  // delay or a manual Continue tap. Auto-advance timer is held in a ref so we
+  // can clear it on unmount or manual continue (no leak, no double-advance).
+  const [showCalibrationConfirm, setShowCalibrationConfirm] = useState(false);
+  const calibrationAdvanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -268,21 +308,46 @@ export default function OnboardingScreen({
     if (event.type === "set" && date) setLastPeriodStart(toISODate(date));
   }
 
-  // Birth-date picker handlers. On confirm we compute + store the age string only;
-  // on Android the picker is a one-shot dialog (it dismisses itself) so we confirm
-  // on "set"; on iOS the inline picker stays open and a Done button confirms.
+  // Birth-date picker handlers. On Android the picker is a one-shot dialog (it
+  // dismisses itself) so we confirm on "set" (Android's "set" event already
+  // implies real user interaction with a chosen date). On iOS the spinner stays
+  // open and ticks onChange continuously — we treat each tick as a commit, but
+  // ONLY if the date actually differs from the initial default (so just opening
+  // the picker, looking at it, and closing it without spinning never commits).
   function applyBirthDate(d: Date) {
     setBirthDate(d);
+    setBirthDateChanged(true);
     setAge(String(ageFromBirthDate(d, new Date())));
   }
   function onChangeBirthDate(event: DateTimePickerEvent, date?: Date) {
     if (Platform.OS === "android") {
       setShowBirthPicker(false);
-      if (event.type === "set" && date) applyBirthDate(date);
+      // Android: "set" only fires after she taps OK on a real date she picked,
+      // so commit if the date differs from the initial default at DAY granularity;
+      // if she somehow tapped OK without scrolling (same calendar day as default),
+      // we intentionally do NOT commit (preserve no-silent-default).
+      if (event.type === "set" && date && !sameDay(date, initialBirthDateRef.current)) {
+        applyBirthDate(date);
+      }
       return;
     }
-    // iOS inline: reflect the spin live; the field is set when she taps Done.
-    if (date) setBirthDate(date);
+    // iOS inline spinner: every onChange tick fires, including the immediate
+    // tick on mount (which can come back with a sub-second-rounded date — that's
+    // why we compare at DAY granularity, not millisecond). Commit ONLY when the
+    // calendar day differs from the initial default — that means she actually
+    // spun to a new value. Opening the picker and closing it without spinning
+    // leaves age="" and BMR null (Coach asks later).
+    if (date && !sameDay(date, initialBirthDateRef.current)) {
+      applyBirthDate(date);
+    }
+  }
+
+  // Toggle the picker UI. Tapping the DOB row alone does NOT set any commit
+  // flag — only an actual spin to a different date does (see onChangeBirthDate
+  // and applyBirthDate). This preserves the "no silent default into BMR" line
+  // for a user who taps to open the picker but never spins.
+  function toggleBirthPicker() {
+    setShowBirthPicker((s) => !s);
   }
 
   function toggleDietChip(key: string) {
@@ -367,43 +432,88 @@ export default function OnboardingScreen({
 
   // Run the calibration. ALWAYS resolves — never throws to the caller — because
   // onboarding must always complete. Drops the base64 either way (use-then-
-  // discard). On success, returns the three short facts to be seeded into Coach
-  // memory at finish(). On failure (network/API/parse/no key/no photos), returns
-  // [] so we soft-skip silently.
-  async function runCalibration(): Promise<string[]> {
+  // discard). On success returns BOTH the structured result (for the
+  // confirmation card UI) and the three short facts to be seeded into Coach
+  // memory at finish(). On failure (network/API/parse/no key/no photos),
+  // returns { result: null, facts: [] } so we soft-skip silently.
+  async function runCalibration(): Promise<{ result: CalibrationResult | null; facts: string[] }> {
     const cur = currentBase64;
     const dst = goalBase64;
     // Always drop the base64 from state after the call — use-then-discard.
     // We do this BEFORE the await so even a navigation interrupt can't leak it.
     setCurrentBase64(null);
     setGoalBase64(null);
-    if (!cur && !dst) return [];
-    if (!hasApiKey()) return [];
+    if (!cur && !dst) return { result: null, facts: [] };
+    if (!hasApiKey()) return { result: null, facts: [] };
     try {
       const result = await calibrateFromPhotos(cur ?? undefined, dst ?? undefined);
       const facts: string[] = [];
       if (result.goal_direction) facts.push(`goal direction: ${result.goal_direction}`);
       if (result.training_emphasis) facts.push(`training emphasis: ${result.training_emphasis}`);
       if (result.motivation) facts.push(`motivation: ${result.motivation}`);
-      return facts;
+      return { result, facts };
     } catch {
       // Soft-skip: no facts seeded, no scary error to her face.
-      return [];
+      return { result: null, facts: [] };
     }
   }
 
   const isLast = stepIndex === STEPS.length - 1;
 
+  // Auto-advance delay for the photo-calibration confirmation card. Long enough
+  // that she can actually READ the three qualitative strings; short enough that
+  // it doesn't feel stuck. A manual "Continue" tap on the card advances
+  // immediately and cancels the timer.
+  const CALIBRATION_CONFIRM_AUTOADVANCE_MS = 2200;
+
+  // Clear the auto-advance timer on unmount so we never call setState after the
+  // screen is gone (and never leak the handle).
+  useEffect(() => {
+    return () => {
+      if (calibrationAdvanceTimer.current != null) {
+        clearTimeout(calibrationAdvanceTimer.current);
+        calibrationAdvanceTimer.current = null;
+      }
+    };
+  }, []);
+
+  // Cancel any pending auto-advance and move to the next step. Idempotent —
+  // safe whether the timer is pending, already fired, or never started.
+  function commitCalibrationAndAdvance() {
+    if (calibrationAdvanceTimer.current != null) {
+      clearTimeout(calibrationAdvanceTimer.current);
+      calibrationAdvanceTimer.current = null;
+    }
+    setShowCalibrationConfirm(false);
+    setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+  }
+
   // Photo step advance: if she added at least one photo we run the vision call
-  // (with a small loading state) and only THEN advance. Otherwise we just
-  // advance. Either way the base64 is dropped before we move on.
+  // (with a small loading state). On a non-empty result we briefly SHOW her the
+  // captured direction in a confirmation card (so she sees the photos
+  // actually produced something) and auto-advance after a short delay; she can
+  // also tap "Continue" to advance immediately. On empty result or skip, we
+  // silently advance as before. Either way the base64 is dropped before we
+  // move on (handled inside runCalibration).
   async function advanceFromPhotos() {
     if (calibrating) return;
     setCalibrating(true);
     try {
-      const facts = await runCalibration();
+      const { result, facts } = await runCalibration();
       setCalibratedFacts(facts);
-      setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+      setCalibrationResult(result);
+      if (result && facts.length > 0) {
+        // Show the confirmation card; arm the auto-advance.
+        setShowCalibrationConfirm(true);
+        calibrationAdvanceTimer.current = setTimeout(() => {
+          calibrationAdvanceTimer.current = null;
+          setShowCalibrationConfirm(false);
+          setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+        }, CALIBRATION_CONFIRM_AUTOADVANCE_MS);
+      } else {
+        // Soft-skip path: no card, just keep moving.
+        setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+      }
     } finally {
       setCalibrating(false);
     }
@@ -413,6 +523,14 @@ export default function OnboardingScreen({
     if (isLast) {
       void finish();
       return;
+    }
+    // Belt-and-suspenders: when leaving the Body step, if she actually SPUN the
+    // birth picker to a different date (birthDateChanged === true) but `age` is
+    // still blank for any reason, commit the current `birthDate` now. The
+    // changed-flag guard preserves "no silent default": a user who opened the
+    // picker but never spun stays at age="" and BMR stays null.
+    if (step === "body" && birthDateChanged && !age) {
+      applyBirthDate(birthDate);
     }
     if (step === "photos") {
       void advanceFromPhotos();
@@ -434,6 +552,19 @@ export default function OnboardingScreen({
     if (saving) return;
     setSaving(true);
     try {
+      // Final safety net for age. Only fires if she actually SPUN the picker
+      // to a different date (birthDateChanged) but the `age` string is still
+      // blank for any reason — compute it from the displayed birthDate now. We
+      // can't rely on a setState here (finish() runs in the same tick) so we
+      // compute locally and use it when building the Profile below. Setting
+      // state too keeps the visible label honest if finish() bails mid-save.
+      // Preserves no-silent-default: a user who never spun stays at age="".
+      let ageForProfile = age.trim();
+      if (birthDateChanged && !ageForProfile) {
+        ageForProfile = String(ageFromBirthDate(birthDate, new Date()));
+        setAge(ageForProfile);
+      }
+
       const chipFacts = dietChips
         .map((k) => DIET_CHIPS.find((c) => c.key === k)?.fact)
         .filter((f): f is string => !!f);
@@ -461,7 +592,7 @@ export default function OnboardingScreen({
         savedFoods: [],
         savedMeals: [],
         weightLog: [],
-        age: age.trim(),
+        age: ageForProfile,
         height: height.trim(),
         weight: weight.trim(),
         goalWeight: "",
@@ -572,14 +703,15 @@ export default function OnboardingScreen({
             <Text style={styles.label}>Date of birth</Text>
             {Platform.OS === "android" ? (
               // Android: a tappable field that opens the system date dialog (one-shot).
-              <TouchableOpacity style={styles.input} onPress={() => setShowBirthPicker(true)}>
+              <TouchableOpacity style={styles.input} onPress={toggleBirthPicker}>
                 <Text style={age ? styles.dobValue : styles.dobPlaceholder}>
                   {age ? `${birthDate.toLocaleDateString()} · age ${age}` : "Tap to choose your birth date"}
                 </Text>
               </TouchableOpacity>
             ) : (
-              // iOS: inline spinner (same pattern Settings/plan use), confirmed by Done.
-              <TouchableOpacity style={styles.input} onPress={() => setShowBirthPicker((s) => !s)}>
+              // iOS: inline spinner (same pattern Settings/plan use). Each spin
+              // tick commits via applyBirthDate — Done just closes the picker UI.
+              <TouchableOpacity style={styles.input} onPress={toggleBirthPicker}>
                 <Text style={age ? styles.dobValue : styles.dobPlaceholder}>
                   {age ? `${birthDate.toLocaleDateString()} · age ${age}` : "Tap to choose your birth date"}
                 </Text>
@@ -599,7 +731,10 @@ export default function OnboardingScreen({
                   <TouchableOpacity
                     style={styles.doneBtn}
                     onPress={() => {
-                      applyBirthDate(birthDate);
+                      // Done just closes the picker. Commit happened (or didn't)
+                      // live in onChangeBirthDate; tapping Done without spinning
+                      // must NOT commit the displayed default. Preserves the
+                      // "no silent default into BMR" line.
                       setShowBirthPicker(false);
                     }}
                   >
@@ -653,7 +788,50 @@ export default function OnboardingScreen({
           </View>
         )}
 
-        {step === "photos" && (
+        {step === "photos" && showCalibrationConfirm && calibrationResult && (
+          // Brief post-call confirmation: she sees that her photos actually
+          // produced something before we advance. Only the three QUALITATIVE
+          // strings render here — no numbers, no body assessment, no
+          // before/after framing (the CALIBRATION_SYSTEM prompt enforces those
+          // constraints at the model layer; this UI just displays the result).
+          // Auto-advances after CALIBRATION_CONFIRM_AUTOADVANCE_MS, or
+          // immediately on Continue. Use-then-discard for the base64 already
+          // happened in runCalibration.
+          <View>
+            <Text style={styles.title}>Got it</Text>
+            <Text style={styles.subtitle}>
+              Saved to your Coach's memory. You can adjust anytime in Settings under "What your
+              Coach remembers about you."
+            </Text>
+
+            <View style={styles.confirmCard}>
+              {calibrationResult.goal_direction ? (
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Direction</Text>
+                  <Text style={styles.confirmValue}>{calibrationResult.goal_direction}</Text>
+                </View>
+              ) : null}
+              {calibrationResult.training_emphasis ? (
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Training focus</Text>
+                  <Text style={styles.confirmValue}>{calibrationResult.training_emphasis}</Text>
+                </View>
+              ) : null}
+              {calibrationResult.motivation ? (
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Why</Text>
+                  <Text style={styles.confirmValue}>{calibrationResult.motivation}</Text>
+                </View>
+              ) : null}
+            </View>
+
+            <TouchableOpacity style={styles.continueBtn} onPress={commitCalibrationAndAdvance}>
+              <Text style={styles.continueBtnText}>Continue</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {step === "photos" && !showCalibrationConfirm && (
           <View>
             <Text style={styles.title}>Your goals in pictures</Text>
             <Text style={styles.subtitle}>
@@ -917,32 +1095,37 @@ export default function OnboardingScreen({
         )}
       </ScrollView>
 
-      {/* Sticky footer nav: Back, optional Skip on skippable steps, and Next. */}
-      <View style={styles.footer}>
-        {stepIndex > 0 ? (
-          <TouchableOpacity style={styles.backBtn} onPress={back} disabled={saving || calibrating}>
-            <Text style={styles.backBtnText}>Back</Text>
-          </TouchableOpacity>
-        ) : (
-          <View style={styles.backBtnSpacer} />
-        )}
+      {/* Sticky footer nav: Back, optional Skip on skippable steps, and Next.
+          While the calibration confirmation card is up, footer controls hide so
+          the user's only forward path is the on-card Continue button (or the
+          auto-advance timer) — keeps her eyes on the result that just landed. */}
+      {!(step === "photos" && showCalibrationConfirm) && (
+        <View style={styles.footer}>
+          {stepIndex > 0 ? (
+            <TouchableOpacity style={styles.backBtn} onPress={back} disabled={saving || calibrating}>
+              <Text style={styles.backBtnText}>Back</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={styles.backBtnSpacer} />
+          )}
 
-        <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving || calibrating}>
-          <Text style={styles.nextBtnText}>
-            {isLast
-              ? saving
-                ? "Setting up…"
-                : startDest === "workout"
-                  ? "Build my plan"
-                  : "Meet your Coach"
-              : step === "photos" && calibrating
-                ? "Reading…"
-                : step === "photos" && !currentUri && !goalUri
-                  ? "Skip"
-                  : "Next"}
-          </Text>
-        </TouchableOpacity>
-      </View>
+          <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving || calibrating}>
+            <Text style={styles.nextBtnText}>
+              {isLast
+                ? saving
+                  ? "Setting up…"
+                  : startDest === "workout"
+                    ? "Build my plan"
+                    : "Meet your Coach"
+                : step === "photos" && calibrating
+                  ? "Reading…"
+                  : step === "photos" && !currentUri && !goalUri
+                    ? "Skip"
+                    : "Next"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
     </View>
   );
 }
@@ -1073,6 +1256,30 @@ const styles = StyleSheet.create({
     marginTop: 16,
   },
   calibratingText: { color: "#666", fontSize: 14 },
+  // Post-calibration confirmation card. A soft, accent-tinted block with three
+  // label/value rows for the qualitative strings the model produced. Read-only
+  // here — facts are seeded into Coach memory at finish() via calibratedFacts,
+  // and editable later in Settings → "What your Coach remembers about you".
+  confirmCard: {
+    borderWidth: 1,
+    borderColor: "#e7e3f2",
+    backgroundColor: "#faf9fd",
+    borderRadius: 14,
+    padding: 16,
+    marginTop: 16,
+    gap: 12,
+  },
+  confirmRow: { gap: 4 },
+  confirmLabel: { fontSize: 13, fontWeight: "700", color: ACCENT, letterSpacing: 0.3 },
+  confirmValue: { fontSize: 15, color: "#1a1a1a", lineHeight: 21 },
+  continueBtn: {
+    marginTop: 18,
+    backgroundColor: ACCENT,
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+  continueBtnText: { color: "#fff", fontSize: 16, fontWeight: "700" },
   // Final "how to start" choice cards.
   startCard: {
     borderWidth: 1,
