@@ -13,7 +13,6 @@ import {
 import { Profile, WeekPlan, WeightEntry, WEEKDAY_LABELS } from "../lib/types";
 import { toISODate, parseISO, addDays } from "../lib/cycle";
 import { computeTargets } from "../lib/targets";
-import { saveProfile } from "../lib/storage";
 import { consumedTotals } from "../lib/food";
 import { weekProgress, dayLogged } from "../lib/plan";
 
@@ -28,10 +27,12 @@ function rangeLabel(startISO: string): string {
 
 export default function ProgressScreen({
   profile,
-  onProfileChange,
+  updateProfile,
 }: {
   profile: Profile;
-  onProfileChange: (p: Profile) => void;
+  // Shared updater (App.tsx): the weight-log transform runs against the LATEST
+  // profile, so a concurrent write can't be clobbered by a stale snapshot.
+  updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
 }) {
   const today = toISODate(new Date());
   const plan = profile.plan;
@@ -61,19 +62,19 @@ export default function ProgressScreen({
   const [weighOpen, setWeighOpen] = useState(false);
   const [weighVal, setWeighVal] = useState("");
 
-  async function persist(p: Profile) {
-    await saveProfile(p);
-    onProfileChange(p);
-  }
-
   async function logWeight() {
     const lbs = parseFloat(weighVal);
     if (!lbs || lbs <= 0) return;
-    const rest = (profile.weightLog ?? []).filter((w) => w.date !== today);
-    const next: WeightEntry[] = [...rest, { date: today, lbs: Math.round(lbs * 10) / 10 }].sort((a, b) =>
-      a.date < b.date ? -1 : 1
-    );
-    await persist({ ...profile, weightLog: next });
+    const rounded = Math.round(lbs * 10) / 10;
+    // Build the new weightLog from the LATEST profile inside the transform, so a
+    // concurrent write to a different field isn't clobbered.
+    await updateProfile((p) => {
+      const rest = (p.weightLog ?? []).filter((w) => w.date !== today);
+      const next: WeightEntry[] = [...rest, { date: today, lbs: rounded }].sort((a, b) =>
+        a.date < b.date ? -1 : 1
+      );
+      return { ...p, weightLog: next };
+    });
     setWeighVal("");
     setWeighOpen(false);
   }

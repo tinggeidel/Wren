@@ -19,7 +19,6 @@ import {
   SYMPTOM_OPTIONS,
   DIGESTION_OPTIONS,
 } from "../lib/types";
-import { saveProfile } from "../lib/storage";
 import {
   toISODate,
   parseISO,
@@ -92,10 +91,12 @@ function monthCells(view: Date): (string | null)[] {
 
 export default function CycleScreen({
   profile,
-  onProfileChange,
+  updateProfile,
 }: {
   profile: Profile;
-  onProfileChange: (p: Profile) => void;
+  // Shared updater (App.tsx): the dayLogs transform runs against the LATEST
+  // profile, so a Coach check-in write can't be clobbered by a stale snapshot.
+  updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
 }) {
   const today = toISODate(new Date());
   const [view, setView] = useState(() => {
@@ -145,17 +146,23 @@ export default function CycleScreen({
     setEditorDate(iso);
   }
 
-  async function persist(dayLogs: Record<string, DayLog>) {
-    const newStarts = cycleStarts({ ...profile, dayLogs });
-    const latest = newStarts.length ? newStarts[newStarts.length - 1] : "";
-    const updated: Profile = { ...profile, dayLogs, lastPeriodStart: latest };
-    await saveProfile(updated);
-    onProfileChange(updated);
+  // Apply a transform to the LATEST profile's dayLogs (not the render-time `logs`
+  // snapshot), then recompute lastPeriodStart from the merged result so the
+  // legacy single-date field stays in sync. Routes through the shared updater so
+  // a Coach check-in that landed after render is preserved.
+  async function persist(transform: (prev: Record<string, DayLog>) => Record<string, DayLog>) {
+    await updateProfile((p) => {
+      const dayLogs = transform(p.dayLogs ?? {});
+      const newStarts = cycleStarts({ ...p, dayLogs });
+      const latest = newStarts.length ? newStarts[newStarts.length - 1] : "";
+      return { ...p, dayLogs, lastPeriodStart: latest };
+    });
   }
 
   async function saveEditor() {
     if (!editorDate) return;
-    const entry: DayLog = { date: editorDate };
+    const date = editorDate;
+    const entry: DayLog = { date };
     if (flow) entry.flow = flow;
     if (energy) entry.energy = energy;
     if (moods.length) entry.moods = moods;
@@ -171,18 +178,23 @@ export default function CycleScreen({
       !entry.digestion &&
       !entry.note;
 
-    const dayLogs = { ...logs };
-    if (isEmpty) delete dayLogs[editorDate];
-    else dayLogs[editorDate] = entry;
-    await persist(dayLogs);
+    await persist((prev) => {
+      const dayLogs = { ...prev };
+      if (isEmpty) delete dayLogs[date];
+      else dayLogs[date] = entry;
+      return dayLogs;
+    });
     setEditorDate(null);
   }
 
   async function clearDay() {
     if (!editorDate) return;
-    const dayLogs = { ...logs };
-    delete dayLogs[editorDate];
-    await persist(dayLogs);
+    const date = editorDate;
+    await persist((prev) => {
+      const dayLogs = { ...prev };
+      delete dayLogs[date];
+      return dayLogs;
+    });
     setEditorDate(null);
   }
 

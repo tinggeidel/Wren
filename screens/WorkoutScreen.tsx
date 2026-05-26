@@ -29,7 +29,6 @@ import {
   EXPERIENCE_OPTIONS,
 } from "../lib/types";
 import { currentPhase, toISODate, parseISO, addDays } from "../lib/cycle";
-import { saveProfile } from "../lib/storage";
 import {
   workoutsFor,
   makeWorkout,
@@ -96,11 +95,14 @@ function dayLabel(iso: string): string {
 
 export default function WorkoutScreen({
   profile,
-  onProfileChange,
+  updateProfile,
   onOpenCoach,
 }: {
   profile: Profile;
-  onProfileChange: (p: Profile) => void;
+  // Shared updater (App.tsx): every transform runs against the LATEST profile,
+  // so plan edits and workout logs compose with the Coach's writes instead of
+  // one silently clobbering the other.
+  updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
   onOpenCoach: () => void;
 }) {
   const today = toISODate(new Date());
@@ -181,10 +183,9 @@ export default function WorkoutScreen({
   // The week is "over" once a new calendar week has started or it's fully done.
   const weekIsOver = !!week && (mondayOf(new Date()) !== week.startDate || isWeekComplete(week));
 
-  async function persist(updated: Profile) {
-    await saveProfile(updated);
-    onProfileChange(updated);
-  }
+  // All persistence goes through the shared updater so each transform applies to
+  // the LATEST profile (never the render-time `profile` prop). Local alias.
+  const persist = updateProfile;
 
   function openPlanSetup() {
     const s = plan?.setup;
@@ -223,7 +224,12 @@ export default function WorkoutScreen({
     setGenError("");
     try {
       const wk = await generateWeekPlan(profile, setup, { weekNumber: 1 });
-      await persist({ ...profile, plan: { setup, current: wk, history: plan?.history ?? [] } });
+      // Overlay onto the LATEST profile: preserve its history (and any other
+      // field the Coach may have written while the plan was generating).
+      await persist((p) => ({
+        ...p,
+        plan: { setup, current: wk, history: p.plan?.history ?? [] },
+      }));
       setSelectedWd(weekdayKey());
       setSetupOpen(false);
     } catch (e) {
@@ -234,8 +240,10 @@ export default function WorkoutScreen({
   }
 
   // Set/clear the logged WorkoutEntry for a plan day, then write the day back.
-  function commitDay(day: PlanDay, wantLogged: boolean): Profile {
-    let prof = profile;
+  // Operates on the passed-in LATEST profile `prof` (supplied by updateProfile),
+  // not the render-time `profile`, so the workoutLogs change composes with any
+  // concurrent write. `day` carries the desired day state to write back.
+  function commitDay(prof: Profile, day: PlanDay, wantLogged: boolean): Profile {
     const cur = prof.plan?.current;
     if (!cur) return prof;
     const next = { ...day };
@@ -255,23 +263,33 @@ export default function WorkoutScreen({
     return { ...prof, plan: { ...prof.plan!, current: { ...cur2, days } } };
   }
 
-  function toggleExercise(sectionIdx: number, exIdx: number) {
-    if (!selectedDay?.sections) return;
-    const newSections = selectedDay.sections.map((s, si) =>
-      si !== sectionIdx
-        ? s
-        : { ...s, exercises: s.exercises.map((e, ei) => (ei !== exIdx ? e : { ...e, done: !e.done })) }
-    );
-    const newDay: PlanDay = { ...selectedDay, sections: newSections };
-    persist(syncStrengthLog(newDay));
+  // Toggle one plan exercise's done state on the LATEST profile, then re-sync the
+  // day's logged workout. We re-find the day (by weekday) and the exercise (by
+  // stable id) in `p.plan.current` rather than reusing the render-time
+  // `selectedDay`, so a concurrent Coach plan edit (adjust/move day) isn't lost.
+  function toggleExercise(exId: string) {
+    const wd = selectedWd;
+    persist((p) => {
+      const cur = p.plan?.current;
+      const day = cur?.days.find((d) => d.weekday === wd);
+      if (!cur || !day?.sections) return p;
+      const newSections = day.sections.map((s) => ({
+        ...s,
+        exercises: s.exercises.map((e) => (e.id === exId ? { ...e, done: !e.done } : e)),
+      }));
+      const newDay: PlanDay = { ...day, sections: newSections };
+      const days = cur.days.map((d) => (d.weekday === wd ? newDay : d));
+      const withDay: Profile = { ...p, plan: { ...p.plan!, current: { ...cur, days } } };
+      return syncStrengthLog(withDay, newDay);
+    });
   }
 
   // Log the day as ONE grouped workout entry containing the checked exercises.
   // Calories = sum of the per-exercise (type-aware) estimates, so it's one total
   // you can override once (e.g. from your Apple Watch). Re-syncs as you check or
-  // uncheck (cancel) exercises; a watch-entered total is preserved.
-  function syncStrengthLog(day: PlanDay): Profile {
-    let prof = profile;
+  // uncheck (cancel) exercises; a watch-entered total is preserved. Operates on
+  // the passed-in LATEST profile `prof`; `day` is the already-updated plan day.
+  function syncStrengthLog(prof: Profile, day: PlanDay): Profile {
     const cur = prof.plan?.current;
     if (!cur) return prof;
     const dateISO = dateForWeekday(cur.startDate, day.weekday);
@@ -326,7 +344,14 @@ export default function WorkoutScreen({
 
   function toggleDayDone() {
     if (!selectedDay) return;
-    persist(commitDay({ ...selectedDay }, !selectedDay.loggedEntryId));
+    const wd = selectedWd;
+    // Re-find the day in the LATEST profile and toggle its completion there.
+    persist((p) => {
+      const cur = p.plan?.current;
+      const day = cur?.days.find((d) => d.weekday === wd);
+      if (!cur || !day) return p;
+      return commitDay(p, { ...day }, !day.loggedEntryId);
+    });
   }
 
   // --- Week in review (Stage B) ---
@@ -357,7 +382,17 @@ export default function WorkoutScreen({
   }
   function acceptReview() {
     if (!plan || !week || !reviewWeek) return;
-    persist({ ...profile, plan: { ...plan, current: reviewWeek, history: [...plan.history, week] } });
+    const nextWeek = reviewWeek;
+    const finishedWeek = week;
+    // Archive the finished week and start the new one, overlaying onto the LATEST
+    // profile so we don't drop a concurrent write.
+    persist((p) => {
+      if (!p.plan) return p;
+      return {
+        ...p,
+        plan: { ...p.plan, current: nextWeek, history: [...p.plan.history, finishedWeek] },
+      };
+    });
     setReviewOpen(false);
     setReviewWeek(null);
     setSelectedWd(weekdayKey());
@@ -433,7 +468,7 @@ export default function WorkoutScreen({
       },
       "manual"
     );
-    await persist(addWorkout(profile, entry));
+    await persist((p) => addWorkout(p, entry));
     setAddOpen(false);
   }
 
@@ -454,7 +489,7 @@ export default function WorkoutScreen({
       },
       "manual"
     );
-    await persist(addWorkout(profile, entry));
+    await persist((p) => addWorkout(p, entry));
     setAddOpen(false);
   }
 
@@ -484,13 +519,14 @@ export default function WorkoutScreen({
         ? { activity: eActName.trim() || editEntry.activity, distance: eActDist.trim() || undefined }
         : {}),
     };
-    await persist(updateWorkout(profile, updated));
+    await persist((p) => updateWorkout(p, updated));
     setEditEntry(null);
   }
 
   async function deleteEntry() {
     if (!editEntry) return;
-    await persist(removeWorkout(profile, editEntry.date, editEntry.id));
+    const { date, id } = editEntry;
+    await persist((p) => removeWorkout(p, date, id));
     setEditEntry(null);
   }
 
@@ -685,11 +721,11 @@ export default function WorkoutScreen({
                         {s.name}
                         {s.durationMin ? ` · ${s.durationMin} min` : ""}
                       </Text>
-                      {s.exercises.map((e, ei) => (
+                      {s.exercises.map((e) => (
                         <TouchableOpacity
                           key={e.id}
                           style={styles.exRow}
-                          onPress={() => toggleExercise(si, ei)}
+                          onPress={() => toggleExercise(e.id)}
                         >
                           <View style={[styles.checkbox, e.done && styles.checkboxOn]}>
                             {e.done ? <Text style={styles.checkmark}>✓</Text> : null}

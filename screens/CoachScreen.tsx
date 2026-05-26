@@ -48,7 +48,7 @@ import {
 import { addMemory, removeMemory } from "../lib/memory";
 import { weekdayKey } from "../lib/plan";
 import { detectCrisisLanguage, CRISIS_RESOURCES_MESSAGE } from "../lib/safety";
-import { loadChat, saveChat, clearChat, saveProfile } from "../lib/storage";
+import { loadChat, saveChat, clearChat } from "../lib/storage";
 import {
   makeEntry,
   addEntry,
@@ -89,11 +89,15 @@ function formatDayLabel(d: string): string {
 
 export default function CoachScreen({
   profile,
-  onProfileChange,
+  updateProfile,
   onOpenSettings,
 }: {
   profile: Profile;
-  onProfileChange: (p: Profile) => void;
+  // Single shared updater (App.tsx). Tool handlers route their PROFILE writes
+  // through this so the Coach and every screen share ONE latest-profile source —
+  // the whole point of the fix. It returns the next profile so a handler can
+  // read the freshly-summed totals to echo back to the model.
+  updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
   onOpenSettings: () => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -174,8 +178,12 @@ export default function CoachScreen({
     }
   }
 
-  // Latest profile, available synchronously inside the tool loop (where several
-  // log_food calls may land in one turn before React re-renders).
+  // Latest profile, available synchronously when we build the per-turn context
+  // for askCoach (it can lag the prop by a render, but the tool ECHOES return the
+  // exact code-summed totals, so the model still gets accurate numbers mid-turn).
+  // PROFILE WRITES no longer happen here — they go through the shared
+  // updateProfile (App.tsx), which composes them on App's single latest-profile
+  // ref. This ref is read-only context; it must never be the write source again.
   const profileRef = useRef(profile);
   useEffect(() => {
     profileRef.current = profile;
@@ -209,8 +217,10 @@ export default function CoachScreen({
   }, []);
 
   // Lets the Coach write food/water she's told about into the structured store.
-  // Each call mutates the working profile, persists it, and reports the new
-  // code-summed totals back to the model.
+  // Each call routes its profile write through the shared updateProfile, which
+  // applies it to App's LATEST profile (composing with screen writes — no clobber)
+  // and returns the next profile. We then read the freshly code-summed totals
+  // from that returned profile to report exact numbers back to the model.
   const runTool: ToolRunner = async (name, input) => {
     const today = toISODate(new Date());
     if (name === "log_food") {
@@ -226,60 +236,57 @@ export default function CoachScreen({
         },
         "coach"
       );
-      const updated = addEntry(profileRef.current, entry);
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
-      const t = consumedTotals(updated, today);
+      const next = await updateProfile((p) => addEntry(p, entry));
+      const t = consumedTotals(next, today);
       return `Logged ${entry.name}${entry.quantityLabel ? ` (${entry.quantityLabel})` : ""}: ${entry.calories} kcal, ${entry.protein}g protein. Today's running total is now ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat.`;
     }
     if (name === "log_water") {
       const a = input as LogWaterArgs;
       const cups = Math.max(0, Math.round(a.cups || 0));
-      const updated = addWater(profileRef.current, today, cups);
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
-      return `Logged ${cups} cup${cups === 1 ? "" : "s"} of water. Today: ${waterFor(updated, today)} of ${WATER_GOAL_CUPS} cups.`;
+      const next = await updateProfile((p) => addWater(p, today, cups));
+      return `Logged ${cups} cup${cups === 1 ? "" : "s"} of water. Today: ${waterFor(next, today)} of ${WATER_GOAL_CUPS} cups.`;
     }
     if (name === "log_checkin") {
       const a = input as LogCheckinArgs;
       const date = a.date && /^\d{4}-\d{2}-\d{2}$/.test(a.date) ? a.date : today;
-      const logs = { ...(profileRef.current.dayLogs ?? {}) };
-      const entry: DayLog = { ...(logs[date] ?? { date }), date };
-
-      if (a.flow === "none") delete entry.flow;
-      else if (a.flow && ["spotting", "light", "medium", "heavy"].includes(a.flow))
-        entry.flow = a.flow as Flow;
-      if (a.energy && ["low", "medium", "high"].includes(a.energy))
-        entry.energy = a.energy as EnergyLevel;
-
+      // The merged day entry is computed INSIDE the transform from the latest
+      // p.dayLogs, so a concurrent dayLogs write (e.g. from the Cycle tab) isn't
+      // clobbered. We capture it here for the echo below.
+      let entry: DayLog = { date };
       const union = (prev: string[] | undefined, add?: string[]) =>
         Array.from(new Set([...(prev ?? []), ...((add ?? []).map((s) => s.trim()).filter(Boolean))]));
-      if (a.moods?.length) entry.moods = union(entry.moods, a.moods);
-      if (a.symptoms?.length) entry.symptoms = union(entry.symptoms, a.symptoms);
-      if (a.digestion?.length) entry.digestion = union(entry.digestion, a.digestion);
-      if (a.note?.trim()) entry.note = entry.note ? `${entry.note}; ${a.note.trim()}` : a.note.trim();
+      await updateProfile((p) => {
+        const logs = { ...(p.dayLogs ?? {}) };
+        entry = { ...(logs[date] ?? { date }), date };
 
-      const meaningful =
-        entry.flow ||
-        entry.energy ||
-        entry.moods?.length ||
-        entry.symptoms?.length ||
-        entry.digestion?.length ||
-        entry.note;
-      if (meaningful) logs[date] = entry;
-      else delete logs[date];
+        if (a.flow === "none") delete entry.flow;
+        else if (a.flow && ["spotting", "light", "medium", "heavy"].includes(a.flow))
+          entry.flow = a.flow as Flow;
+        if (a.energy && ["low", "medium", "high"].includes(a.energy))
+          entry.energy = a.energy as EnergyLevel;
 
-      const starts = cycleStarts({ ...profileRef.current, dayLogs: logs });
-      const updated: Profile = {
-        ...profileRef.current,
-        dayLogs: logs,
-        lastPeriodStart: starts.length ? starts[starts.length - 1] : "",
-      };
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
+        if (a.moods?.length) entry.moods = union(entry.moods, a.moods);
+        if (a.symptoms?.length) entry.symptoms = union(entry.symptoms, a.symptoms);
+        if (a.digestion?.length) entry.digestion = union(entry.digestion, a.digestion);
+        if (a.note?.trim()) entry.note = entry.note ? `${entry.note}; ${a.note.trim()}` : a.note.trim();
+
+        const meaningful =
+          entry.flow ||
+          entry.energy ||
+          entry.moods?.length ||
+          entry.symptoms?.length ||
+          entry.digestion?.length ||
+          entry.note;
+        if (meaningful) logs[date] = entry;
+        else delete logs[date];
+
+        const starts = cycleStarts({ ...p, dayLogs: logs });
+        return {
+          ...p,
+          dayLogs: logs,
+          lastPeriodStart: starts.length ? starts[starts.length - 1] : "",
+        };
+      });
 
       const parts: string[] = [];
       if (entry.flow) parts.push(`flow ${entry.flow}`);
@@ -298,6 +305,7 @@ export default function CoachScreen({
       const date = a.date && /^\d{4}-\d{2}-\d{2}$/.test(a.date) ? a.date : today;
 
       // Burned: use her watch number if given, else estimate in code from weight.
+      // Weight is a stable profile field — reading it from the prop ref is fine.
       const kg = profileWeightKg(profileRef.current);
       const watch = a.caloriesBurned && a.caloriesBurned > 0 ? Math.round(a.caloriesBurned) : null;
       const est = estimateBurn(kind, a.activity, a.durationMin, kg);
@@ -340,10 +348,7 @@ export default function CoachScreen({
           "coach"
         );
       }
-      const updated = addWorkout(profileRef.current, entry);
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
+      await updateProfile((p) => addWorkout(p, entry));
       const burnNote = entry.caloriesBurned
         ? `, ~${entry.caloriesBurned} cal burned${entry.burnSource === "estimate" ? " (est.)" : ""}`
         : "";
@@ -351,8 +356,8 @@ export default function CoachScreen({
     }
     if (name === "adjust_workout_day") {
       const a = input as AdjustDayArgs;
-      const cur = profileRef.current.plan?.current;
-      if (!cur) return "There's no active plan to adjust — she can create one on the Workout tab.";
+      if (!profileRef.current.plan?.current)
+        return "There's no active plan to adjust — she can create one on the Workout tab.";
       const wd = a.weekday ?? weekdayKey();
       const kind = a.kind ?? (a.exercises?.length ? "strength" : a.activity ? "activity" : "rest");
       const day: PlanDay = {
@@ -382,14 +387,14 @@ export default function CoachScreen({
             : undefined,
         activity: kind === "activity" ? a.activity?.trim() || a.title?.trim() : undefined,
       };
-      const days = cur.days.map((d) => (d.weekday === wd ? day : d));
-      const updated: Profile = {
-        ...profileRef.current,
-        plan: { ...profileRef.current.plan!, current: { ...cur, days } },
-      };
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
+      // Map the day into the LATEST plan inside the transform (no-op if the plan
+      // was cleared concurrently), so this composes with other plan writes.
+      await updateProfile((p) => {
+        const cur = p.plan?.current;
+        if (!cur) return p;
+        const days = cur.days.map((d) => (d.weekday === wd ? day : d));
+        return { ...p, plan: { ...p.plan!, current: { ...cur, days } } };
+      });
       const dayName = wd === weekdayKey() ? "today" : WEEKDAY_LABELS[wd];
       return `Updated ${dayName}'s workout to "${day.title}" (${day.intensity}). It's on her Plan tab to check off.`;
     }
@@ -398,8 +403,10 @@ export default function CoachScreen({
       const cur = profileRef.current.plan?.current;
       if (!cur) return "There's no active plan to reschedule.";
       if (!a.from || !a.to || a.from === a.to) return "I need two different days to move between.";
-      const from = cur.days.find((d) => d.weekday === a.from);
-      const to = cur.days.find((d) => d.weekday === a.to);
+      const fromArg = a.from;
+      const toArg = a.to;
+      const from = cur.days.find((d) => d.weekday === fromArg);
+      const to = cur.days.find((d) => d.weekday === toArg);
       if (!from || !to) return "Couldn't find those days in the plan.";
       // Swap the two days' contents, keeping their weekday slots; clear completion
       // (rescheduled = not done yet) on the day and its exercises.
@@ -412,16 +419,19 @@ export default function CoachScreen({
           exercises: s.exercises.map((e) => ({ ...e, done: undefined })),
         })),
       });
-      const days = cur.days.map((d) =>
-        d.weekday === a.from ? place(d, to) : d.weekday === a.to ? place(d, from) : d
-      );
-      const updated: Profile = {
-        ...profileRef.current,
-        plan: { ...profileRef.current.plan!, current: { ...cur, days } },
-      };
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
+      // Apply the swap against the LATEST plan inside the transform, re-finding
+      // the days there so a concurrent plan edit isn't clobbered.
+      await updateProfile((p) => {
+        const cur2 = p.plan?.current;
+        if (!cur2) return p;
+        const f = cur2.days.find((d) => d.weekday === fromArg);
+        const t = cur2.days.find((d) => d.weekday === toArg);
+        if (!f || !t) return p;
+        const days = cur2.days.map((d) =>
+          d.weekday === fromArg ? place(d, t) : d.weekday === toArg ? place(d, f) : d
+        );
+        return { ...p, plan: { ...p.plan!, current: { ...cur2, days } } };
+      });
       return `Moved ${WEEKDAY_LABELS[a.from]}'s "${from.title}" to ${WEEKDAY_LABELS[a.to]} (and swapped what was on ${WEEKDAY_LABELS[a.to]} back to ${WEEKDAY_LABELS[a.from]}).`;
     }
     if (name === "remember_fact") {
@@ -431,12 +441,16 @@ export default function CoachScreen({
       // actually fires this tool (vs. just saying "I'll remember" in prose).
       console.log("[Coach] remember_fact called:", JSON.stringify(a));
       if (!fact) return "Nothing to remember — no fact given.";
-      const updated = addMemory(profileRef.current, fact);
-      // addMemory is a no-op on a duplicate, so detect that to report honestly.
-      if (updated === profileRef.current) return `Already remembered "${fact}".`;
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
+      // addMemory is a no-op on a duplicate (returns the same object), so detect
+      // that inside the transform — against the LATEST coachMemory — to report
+      // honestly without clobbering a concurrent memory write.
+      let wasDuplicate = false;
+      await updateProfile((p) => {
+        const updated = addMemory(p, fact);
+        wasDuplicate = updated === p;
+        return updated;
+      });
+      if (wasDuplicate) return `Already remembered "${fact}".`;
       return `Got it — I'll remember that: "${fact}". (Saved to long-term memory; she can view or delete it in Settings.)`;
     }
     if (name === "forget_fact") {
@@ -444,27 +458,37 @@ export default function CoachScreen({
       console.log("[Coach] forget_fact called:", JSON.stringify(a));
       const q = (a.fact ?? "").trim().toLowerCase();
       if (!q) return "Nothing to forget — no fact given.";
-      // Safe match: (1) prefer an exact (case-insensitive) hit; else (2) stored
-      // facts whose text CONTAINS the full query. We deliberately do NOT match the
-      // q.includes(t) direction: a long forget query that merely contains a short
-      // stored fact (e.g. "no dairy") could nuke a real restriction/allergy.
-      const items = profileRef.current.coachMemory ?? [];
-      const exact = items.find((m) => m.text.trim().toLowerCase() === q);
-      const candidates = exact
-        ? [exact]
-        : items.filter((m) => m.text.toLowerCase().includes(q));
-      // Only delete on an unambiguous single match. Zero or many -> remove nothing
-      // and tell the model so it can ask her to be specific.
-      if (candidates.length === 0)
+      // The match decision must run against the LATEST coachMemory, so we do it
+      // inside the transform and capture the outcome for the echo. Only an
+      // unambiguous single match deletes; 0 or many -> no-op (return p unchanged).
+      // Held in a typed object so the closure mutation survives narrowing.
+      const result: { kind: "none" | "many" | "deleted"; text: string } = { kind: "none", text: "" };
+      await updateProfile((p) => {
+        // Safe match: (1) prefer an exact (case-insensitive) hit; else (2) stored
+        // facts whose text CONTAINS the full query. We deliberately do NOT match
+        // the q.includes(t) direction: a long forget query that merely contains a
+        // short stored fact (e.g. "no dairy") could nuke a real restriction.
+        const items = p.coachMemory ?? [];
+        const exact = items.find((m) => m.text.trim().toLowerCase() === q);
+        const candidates = exact ? [exact] : items.filter((m) => m.text.toLowerCase().includes(q));
+        if (candidates.length === 0) {
+          result.kind = "none";
+          return p;
+        }
+        if (candidates.length > 1) {
+          result.kind = "many";
+          return p;
+        }
+        const match = candidates[0];
+        result.kind = "deleted";
+        result.text = match.text;
+        return removeMemory(p, match.id);
+      });
+      if (result.kind === "none")
         return `I don't have a saved fact matching "${a.fact}", so nothing to forget.`;
-      if (candidates.length > 1)
+      if (result.kind === "many")
         return `I have a few saved facts that could match "${a.fact}", so I didn't remove anything. Ask her which one to forget.`;
-      const match = candidates[0];
-      const updated = removeMemory(profileRef.current, match.id);
-      profileRef.current = updated;
-      await saveProfile(updated);
-      onProfileChange(updated);
-      return `Done — I've forgotten "${match.text}".`;
+      return `Done — I've forgotten "${result.text}".`;
     }
     return `Unknown tool ${name}.`;
   };

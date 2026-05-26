@@ -23,7 +23,6 @@ import {
 } from "../lib/types";
 import { toISODate, parseISO, addDays } from "../lib/cycle";
 import { targetForDate, planDayForDate } from "../lib/plan";
-import { saveProfile } from "../lib/storage";
 import {
   consumedTotals,
   remaining,
@@ -79,10 +78,12 @@ function dateLabel(iso: string): string {
 
 export default function FoodScreen({
   profile,
-  onProfileChange,
+  updateProfile,
 }: {
   profile: Profile;
-  onProfileChange: (p: Profile) => void;
+  // Shared updater (App.tsx): the transform runs against the LATEST profile, so
+  // a Coach write between this screen's render and a save can't be clobbered.
+  updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
 }) {
   const today = toISODate(new Date());
   // Calendar (Cal AI–style strip): the selected day drives everything below.
@@ -159,10 +160,10 @@ export default function FoodScreen({
   const [eC, setEC] = useState("");
   const [eF, setEF] = useState("");
 
-  async function persist(updated: Profile) {
-    await saveProfile(updated);
-    onProfileChange(updated);
-  }
+  // All persistence goes through the shared updater so the transform applies to
+  // the LATEST profile (never the render-time `profile` prop). `persist` here is
+  // just a local alias for readability at the call sites.
+  const persist = updateProfile;
 
   function openAdd() {
     setMode("search");
@@ -336,26 +337,30 @@ export default function FoodScreen({
   }
 
   // --- Saved foods ---
+  // entryFromSaved builds a NEW entry (fresh id) each call, so wrapping the build
+  // inside the transform keeps it deterministic for the single applied call.
   function logSavedFood(s: SavedFood) {
-    persist(addEntry(profile, entryFromSaved(s, selDate)));
+    persist((p) => addEntry(p, entryFromSaved(s, selDate)));
     setAddOpen(false);
   }
   function removeFav(id: string) {
-    persist(removeSavedFood(profile, id));
+    persist((p) => removeSavedFood(p, id));
   }
   function saveRecentFood(e: FoodEntry) {
-    persist(saveFood(profile, toSavedFood(e)));
+    persist((p) => saveFood(p, toSavedFood(e)));
   }
 
   // --- Saved meals: one tap logs every item to the selected day ---
   function logMeal(m: SavedMeal) {
-    let p = profile;
-    for (const it of m.items) p = addEntry(p, entryFromSaved(it, selDate, "meal"));
-    persist(p);
+    persist((p) => {
+      let next = p;
+      for (const it of m.items) next = addEntry(next, entryFromSaved(it, selDate, "meal"));
+      return next;
+    });
     setAddOpen(false);
   }
   function removeMeal(id: string) {
-    persist(removeSavedMeal(profile, id));
+    persist((p) => removeSavedMeal(p, id));
   }
 
   // --- Meal builder ---
@@ -441,7 +446,7 @@ export default function FoodScreen({
         })
       ),
     };
-    await persist(saveMeal(profile, newMeal));
+    await persist((p) => saveMeal(p, newMeal));
     setMealBuilderOpen(false);
   }
 
@@ -453,23 +458,25 @@ export default function FoodScreen({
   }
 
   async function savePhotoItems() {
-    let p = profile;
-    for (const d of drafts) {
-      const entry = makeEntry(
-        {
-          name: d.name.trim() || "Food",
-          quantityLabel: d.quantity.trim() || undefined,
-          calories: parseFloat(d.calories) || 0,
-          protein: parseFloat(d.protein) || 0,
-          carbs: parseFloat(d.carbs) || 0,
-          fat: parseFloat(d.fat) || 0,
-          date: selDate,
-        },
-        "photo"
-      );
-      p = addEntry(p, entry);
-    }
-    await persist(p);
+    await persist((p) => {
+      let next = p;
+      for (const d of drafts) {
+        const entry = makeEntry(
+          {
+            name: d.name.trim() || "Food",
+            quantityLabel: d.quantity.trim() || undefined,
+            calories: parseFloat(d.calories) || 0,
+            protein: parseFloat(d.protein) || 0,
+            carbs: parseFloat(d.carbs) || 0,
+            fat: parseFloat(d.fat) || 0,
+            date: selDate,
+          },
+          "photo"
+        );
+        next = addEntry(next, entry);
+      }
+      return next;
+    });
     setPhotoReview(false);
     setDrafts([]);
     setPhotoUri(null);
@@ -500,9 +507,11 @@ export default function FoodScreen({
       },
       pendingHit.barcode ? "barcode" : "search"
     );
-    let p = addEntry(profile, entry);
-    if (saveFav) p = saveFood(p, toSavedFood(entry));
-    await persist(p);
+    await persist((p) => {
+      let next = addEntry(p, entry);
+      if (saveFav) next = saveFood(next, toSavedFood(entry));
+      return next;
+    });
     setSaveFav(false);
     setAddOpen(false);
     setPendingHit(null);
@@ -524,9 +533,11 @@ export default function FoodScreen({
       },
       "manual"
     );
-    let p = addEntry(profile, entry);
-    if (mSave) p = saveFood(p, toSavedFood(entry));
-    await persist(p);
+    await persist((p) => {
+      let next = addEntry(p, entry);
+      if (mSave) next = saveFood(next, toSavedFood(entry));
+      return next;
+    });
     setMName("");
     setMQty("");
     setMCal("");
@@ -553,7 +564,7 @@ export default function FoodScreen({
       },
       e.source
     );
-    await persist(addEntry(profile, entry));
+    await persist((p) => addEntry(p, entry));
     setAddOpen(false);
   }
 
@@ -569,7 +580,7 @@ export default function FoodScreen({
 
   async function saveEdit() {
     if (!editEntry) return;
-    const updated = updateEntry(profile, {
+    const edited: FoodEntry = {
       ...editEntry,
       name: eName.trim() || editEntry.name,
       quantityLabel: eQty.trim() || undefined,
@@ -577,35 +588,32 @@ export default function FoodScreen({
       protein: Math.round(parseFloat(eP) || 0),
       carbs: Math.round(parseFloat(eC) || 0),
       fat: Math.round(parseFloat(eF) || 0),
-    });
-    await persist(updated);
+    };
+    await persist((p) => updateEntry(p, edited));
     setEditEntry(null);
   }
 
   async function deleteEdit() {
     if (!editEntry) return;
-    await persist(removeEntry(profile, editEntry.date, editEntry.id));
+    const { date, id } = editEntry;
+    await persist((p) => removeEntry(p, date, id));
     setEditEntry(null);
   }
 
   async function saveEditAsFood() {
     if (!editEntry) return;
-    await persist(
-      saveFood(
-        profile,
-        toSavedFood({
-          name: eName.trim() || editEntry.name,
-          brand: editEntry.brand,
-          calories: parseFloat(eCal) || 0,
-          protein: parseFloat(eP) || 0,
-          carbs: parseFloat(eC) || 0,
-          fat: parseFloat(eF) || 0,
-          quantityLabel: eQty.trim() || undefined,
-          per100g: editEntry.per100g,
-          barcode: editEntry.barcode,
-        })
-      )
-    );
+    const saved = toSavedFood({
+      name: eName.trim() || editEntry.name,
+      brand: editEntry.brand,
+      calories: parseFloat(eCal) || 0,
+      protein: parseFloat(eP) || 0,
+      carbs: parseFloat(eC) || 0,
+      fat: parseFloat(eF) || 0,
+      quantityLabel: eQty.trim() || undefined,
+      per100g: editEntry.per100g,
+      barcode: editEntry.barcode,
+    });
+    await persist((p) => saveFood(p, saved));
     Alert.alert("Saved", "Added to your saved foods.");
   }
 
@@ -714,7 +722,7 @@ export default function FoodScreen({
           <View style={styles.waterControls}>
             <TouchableOpacity
               style={styles.waterBtn}
-              onPress={() => persist(addWater(profile, selDate, -1))}
+              onPress={() => persist((p) => addWater(p, selDate, -1))}
             >
               <Text style={styles.waterBtnText}>－</Text>
             </TouchableOpacity>
@@ -723,7 +731,7 @@ export default function FoodScreen({
             </Text>
             <TouchableOpacity
               style={styles.waterBtn}
-              onPress={() => persist(addWater(profile, selDate, 1))}
+              onPress={() => persist((p) => addWater(p, selDate, 1))}
             >
               <Text style={styles.waterBtnText}>＋</Text>
             </TouchableOpacity>

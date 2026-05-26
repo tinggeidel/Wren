@@ -22,7 +22,6 @@ import {
   CALORIE_MODE_LABELS,
   CoachMemory,
 } from "../lib/types";
-import { saveProfile } from "../lib/storage";
 import { toISODate } from "../lib/cycle";
 import { computeTargets } from "../lib/targets";
 import { removeMemory } from "../lib/memory";
@@ -40,14 +39,18 @@ function parseDateOrToday(s: string): Date {
 
 export default function SettingsScreen({
   initial,
+  updateProfile,
   onSaved,
-  onProfileChange,
 }: {
   initial: Profile | null;
-  onSaved: (p: Profile) => void;
-  // Like CoachScreen's prop: updates the parent's profile WITHOUT switching tabs.
-  // Used by per-row memory deletes so they stay put on Settings.
-  onProfileChange?: (p: Profile) => void;
+  // Single shared updater (App.tsx). Applies the form overlay to the LATEST
+  // profile, never `initial` (a render-time snapshot), so sibling maps —
+  // dayLogs/foodLogs/workoutLogs/savedFoods/savedMeals/weightLog/plan/
+  // coachMemory — and any out-of-band Coach writes are preserved on Save.
+  updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
+  // Navigation-only side effect after a full Save (jump to the Coach tab).
+  // Per-row memory deletes deliberately do NOT call this, so they stay put.
+  onSaved: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [goal, setGoal] = useState<Goal>(initial?.goal ?? "feel_better");
@@ -74,7 +77,13 @@ export default function SettingsScreen({
   const coachMemory: CoachMemory[] = initial?.coachMemory ?? [];
   const [showPicker, setShowPicker] = useState(false);
 
-  function buildProfile(): Profile {
+  // Overlay the form fields onto the LATEST profile `p` (passed in by
+  // updateProfile at save time). Every NON-form field — the data maps and the
+  // plan/memory — is taken from `p`, not from the render-time `initial` snapshot,
+  // so a Coach write (or any other screen's write) that landed after this screen
+  // rendered is preserved rather than clobbered. This is also the wipe-guard:
+  // we never reset these to {} / [] from a stale snapshot.
+  function buildProfileFromForm(p: Profile): Profile {
     return {
       name: name.trim(),
       goal,
@@ -89,20 +98,22 @@ export default function SettingsScreen({
       goalWeight: goalWeight.trim(),
       activityLevel,
       calorieMode,
-      dayLogs: initial?.dayLogs ?? {}, // preserve cycle history — never wipe it on save
-      foodLogs: initial?.foodLogs ?? {}, // preserve food log on save (same rule)
-      waterLogs: initial?.waterLogs ?? {}, // preserve water log on save
-      workoutLogs: initial?.workoutLogs ?? {}, // preserve workout log on save
-      savedFoods: initial?.savedFoods ?? [], // preserve saved foods on save
-      savedMeals: initial?.savedMeals ?? [], // preserve saved meals on save
-      weightLog: initial?.weightLog ?? [], // preserve weight log on save
-      plan: initial?.plan, // preserve the tailored plan on save
-      coachMemory: initial?.coachMemory ?? [], // preserve long-term Coach memory from the live prop (don't clobber out-of-band adds)
+      dayLogs: p.dayLogs ?? {}, // preserve cycle history — never wipe it on save
+      foodLogs: p.foodLogs ?? {}, // preserve food log on save (same rule)
+      waterLogs: p.waterLogs ?? {}, // preserve water log on save
+      workoutLogs: p.workoutLogs ?? {}, // preserve workout log on save
+      savedFoods: p.savedFoods ?? [], // preserve saved foods on save
+      savedMeals: p.savedMeals ?? [], // preserve saved meals on save
+      weightLog: p.weightLog ?? [], // preserve weight log on save
+      plan: p.plan, // preserve the tailored plan on save
+      coachMemory: p.coachMemory ?? [], // preserve long-term Coach memory (don't clobber out-of-band adds)
     };
   }
 
-  // Live-computed targets shown in this screen (the home for macros).
-  const targets = computeTargets(buildProfile());
+  // Live-computed targets shown in this screen (the home for macros). Display
+  // only — overlay the form onto the render-time `initial` (or {} on first run);
+  // the authoritative save uses the latest profile via updateProfile.
+  const targets = computeTargets(buildProfileFromForm(initial ?? ({} as Profile)));
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -115,22 +126,19 @@ export default function SettingsScreen({
   }
 
   async function handleSave() {
-    const profile = buildProfile();
-    await saveProfile(profile);
-    onSaved(profile);
+    // Overlay the form onto the LATEST profile (via updateProfile's ref), then
+    // navigate to the Coach tab. Persistence is handled by updateProfile.
+    await updateProfile((p) => buildProfileFromForm(p));
+    onSaved();
   }
 
   // Delete one remembered fact. Persists right away (so it sticks even if she
-  // leaves without tapping Save). It removes from the LAST-SAVED live profile
-  // (`initial`), not buildProfile(), so it does NOT commit any unsaved edits to
-  // other form fields. It updates the parent via onProfileChange (setProfile
-  // only, no tab change), so she stays on Settings and the list refreshes in
-  // place. (If a row is visible, `initial` exists; guard the theoretical null.)
+  // leaves without tapping Save), via updateProfile so it composes on the LATEST
+  // profile — it does NOT commit any unsaved edits to the form's other fields,
+  // and it deliberately does NOT navigate (no onSaved), so she stays on Settings
+  // and the list refreshes in place.
   async function handleForget(id: string) {
-    if (!initial) return;
-    const next = removeMemory(initial, id);
-    await saveProfile(next);
-    onProfileChange?.(next);
+    await updateProfile((p) => removeMemory(p, id));
   }
 
   return (
