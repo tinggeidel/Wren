@@ -10,6 +10,7 @@ import CycleScreen from "./screens/CycleScreen";
 import WorkoutScreen from "./screens/WorkoutScreen";
 import ProgressScreen from "./screens/ProgressScreen";
 import SettingsScreen from "./screens/SettingsScreen";
+import OnboardingScreen from "./screens/OnboardingScreen";
 
 // "settings" is a valid screen but not a bottom-bar tab — it's opened from the
 // gear in the Coach header.
@@ -114,22 +115,13 @@ export default function App() {
             <ActivityIndicator size="large" />
           </View>
         ) : !profile ? (
-          // First run: onboarding, no tabs until there's a profile. The form
-          // builds the initial profile from scratch (latest p is irrelevant here
-          // since none exists), so we persist it via initProfile and land on Coach.
-          <SettingsScreen
-            initial={null}
-            // Onboarding: no profile exists yet, so the form builds one from
-            // scratch. We feed updateProfile an empty base — buildProfileFromForm
-            // overlays every field onto it, producing a complete first profile —
-            // and persist via initProfile so it becomes the source of truth.
-            updateProfile={async (updater) => {
-              const next = updater({} as Profile);
-              await initProfile(next);
-              return next;
-            }}
-            onSaved={() => setTab("coach")}
-          />
+          // First run: the guided onboarding flow, no tabs until there's a profile.
+          // It builds the complete first Profile from scratch (same documented
+          // shape — no widening) and persists it via initProfile, which makes it the
+          // single source of truth, then lands on the Coach tab. Returning users
+          // (a stored profile exists) skip this entirely; Settings (the gear) stays
+          // the place to edit the profile later.
+          <OnboardingScreen initProfile={initProfile} onDone={() => setTab("coach")} />
         ) : (
           <View style={styles.flex}>
             {/* All screens stay mounted; inactive ones are hidden so the Coach's
