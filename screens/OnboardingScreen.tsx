@@ -83,7 +83,12 @@ function minBirthDate(): Date {
 // programmatic/initial layout doesn't count as a user choice — the parent decides
 // "touched" from that.
 const ITEM_H = 40;
-const VISIBLE = 5; // odd, so there's a clear middle row
+// 3 visible rows (was 5) keeps the wheel short (120px) so the whole Body step —
+// DOB + height + weight + Activity Level — fits one phone screen without the
+// outer page needing to scroll. That removes the wheel-vs-page vertical gesture
+// conflict that made Activity Level unreachable. Still odd, so there's a clear
+// centered middle row for the selection band.
+const VISIBLE = 3;
 const WHEEL_H = ITEM_H * VISIBLE;
 
 function WheelPicker({
@@ -118,6 +123,11 @@ function WheelPicker({
       <View pointerEvents="none" style={styles.wheelBand} />
       <ScrollView
         ref={ref}
+        // nestedScrollEnabled lets Android hand the gesture back to the parent
+        // page ScrollView when this short wheel reaches its scroll bounds. On iOS
+        // it's a no-op, but with VISIBLE=3 the page shouldn't need to scroll at
+        // all on a typical phone, so this is purely a small-screen safety net.
+        nestedScrollEnabled
         showsVerticalScrollIndicator={false}
         snapToInterval={ITEM_H}
         decelerationRate="fast"
@@ -457,7 +467,14 @@ export default function OnboardingScreen({
               </View>
             )}
 
-            <Text style={styles.label}>Height</Text>
+            {/* Height (ft + in) and Weight share one short wheel row so the whole
+                step fits the viewport. Three narrow wheels side by side leave wide
+                non-wheel strips (the gaps + labels) the user can grab to scroll the
+                page on small screens, instead of dragging over a wheel. */}
+            <View style={styles.wheelLabelRow}>
+              <Text style={[styles.label, styles.wheelLabelHeight]}>Height</Text>
+              <Text style={[styles.label, styles.wheelLabelWeight]}>Weight</Text>
+            </View>
             <View style={styles.wheelRow}>
               <View style={styles.wheelGroup}>
                 <WheelPicker
@@ -475,14 +492,7 @@ export default function OnboardingScreen({
                   labelFor={(v) => `${v} in`}
                 />
               </View>
-            </View>
-            <Text style={styles.hint}>
-              {heightTouched ? `Set to ${FEET[feetIdx]}'${INCHES[inchIdx]}".` : "Scroll to set your height — or skip."}
-            </Text>
-
-            <Text style={styles.label}>Weight</Text>
-            <View style={styles.wheelRow}>
-              <View style={styles.wheelGroupWide}>
+              <View style={styles.wheelGroup}>
                 <WheelPicker
                   values={WEIGHTS}
                   selectedIndex={weightIdx}
@@ -492,7 +502,9 @@ export default function OnboardingScreen({
               </View>
             </View>
             <Text style={styles.hint}>
-              {weightTouched ? `Set to ${WEIGHTS[weightIdx]} lb.` : "Scroll to set your weight — or skip."}
+              {heightTouched ? `Height ${FEET[feetIdx]}'${INCHES[inchIdx]}".` : "Scroll to set height"}
+              {"  ·  "}
+              {weightTouched ? `Weight ${WEIGHTS[weightIdx]} lb.` : "scroll to set weight — or skip both."}
             </Text>
 
             <Text style={styles.label}>Activity level</Text>
@@ -746,10 +758,13 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 14, color: "#333" },
   chipTextActive: { color: "#fff", fontWeight: "600" },
   hint: { fontSize: 13, color: "#666", marginTop: 10, lineHeight: 18 },
-  // Scroll-wheel pickers (height ft/in, weight lb).
-  wheelRow: { flexDirection: "row", gap: 12, marginTop: 6 },
+  // Scroll-wheel pickers (height ft/in, weight lb) — three side by side.
+  wheelRow: { flexDirection: "row", gap: 10, marginTop: 2 },
   wheelGroup: { flex: 1 },
-  wheelGroupWide: { flex: 1 },
+  // Header row that labels the two wheel groups (Height spans ft+in, Weight one).
+  wheelLabelRow: { flexDirection: "row", marginTop: 16 },
+  wheelLabelHeight: { flex: 2, marginTop: 0, marginBottom: 0 },
+  wheelLabelWeight: { flex: 1, marginTop: 0, marginBottom: 0 },
   wheel: {
     height: WHEEL_H,
     borderWidth: 1,
