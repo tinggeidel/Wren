@@ -316,10 +316,22 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
 // Haiku is markedly less reliable at *proactively* deciding to fire remember_fact
 // when nothing forces it, so a user saying "I'm vegetarian" on Haiku often gets a
 // prose "I'll remember that" with no tool call and nothing persists. Sonnet
-// reliably calls the tool. These phrases are intentionally broad but cheap — they
-// only fire on first-person disclosures, not every message.
+// reliably calls the tool.
+//
+// TIGHTENED (cost): this list used to include loose, everyday-chatter phrases
+// ("i like", "i love", "i hate", "at home", "i have a", bare "knee"/"shoulder",
+// "wedding", "i work") that escalated casual messages to Sonnet for no durable
+// fact. We now fire ONLY on strong durable-fact signals:
+//   - allergies / intolerances: "allergic", "intolerant", "can't/don't eat",
+//   - dietary identity: vegetarian, vegan, pescatarian, dairy-free, gluten-free,
+//   - explicit memory asks: "remember", "forget", "note that",
+//   - injury phrasing that includes an injury word: "injured", "injury", "torn",
+//     "sprained", or "bad <bodypart>".
+// The strengthened LONG-TERM MEMORY system prompt still pushes the tool, and Haiku
+// CAN call tools, so an occasional Haiku turn on a missed phrasing is acceptable —
+// we bias toward NOT over-escalating.
 const MEMORY_TRIGGERS =
-  /\bremember\b|\bforget\b|\bvegetarian\b|\bvegan\b|\bpescatarian\b|\bgluten\b|\bdairy\b|\blactose\b|\ballerg|\bintoleran|i (can'?t|cannot|don'?t|do not|won'?t) (eat|have|do)|\binjur|\bsurgery\b|\bknee\b|\bshoulder\b|\bback (pain|injury|issue)|\bi prefer\b|\bi like\b|\bi love\b|\bi hate\b|\bi don'?t like\b|\bi'?m training for\b|\btraining for (a|my)\b|\bwedding\b|\bi work\b|\bnight shift\b|\bi only have\b|\bi train at\b|\bat home\b|\bi have (a|an)\b/;
+  /\bremember\b|\bforget\b|\bnote that\b|\ballerg|\bintoleran|i (can'?t|cannot|don'?t|do not|won'?t) (eat|have)|\bvegetarian\b|\bvegan\b|\bpescatarian\b|\b(dairy|gluten)[\s-]free\b|\binjur|\btorn\b|\bsprain|\bbad (left |right |lower |upper )?(knee|shoulder|back|hip|ankle|wrist|elbow|neck|foot|leg)/;
 
 function pickModel(text: string): string {
   const t = text.toLowerCase();
@@ -772,15 +784,19 @@ function summaryLine(m: ChatMessage): string {
 }
 
 // Merge the prior running summary with the newly aged-out messages into one
-// concise running summary. Cheap Haiku call, low max_tokens. On ANY failure the
-// caller keeps the prior summary and retries next batch — continuity degrades to
+// concise running summary. Cheap Haiku call, low max_tokens. Returns the merged
+// summary on success, or null when there is nothing new to fold or the model
+// returned an empty extraction. A null tells the caller NOT to advance
+// summarizedCount (so the batch is retried next time) rather than marking messages
+// folded into a summary that didn't include them. On a thrown error (network/API)
+// the caller likewise keeps the prior summary and retries — continuity degrades to
 // "last 16 messages only", it never crashes the chat.
 export async function summarizeConversation(
   priorSummary: string,
   messagesToFold: ChatMessage[]
-): Promise<string> {
+): Promise<string | null> {
   if (!hasApiKey()) throw new Error("no api key");
-  if (!messagesToFold.length) return priorSummary;
+  if (!messagesToFold.length) return null;
   const folded = messagesToFold.map(summaryLine).join("\n");
   const userContent = [
     priorSummary.trim()
@@ -819,8 +835,10 @@ export async function summarizeConversation(
   }
   const data = (await res.json()) as { content?: ContentBlock[] };
   const text = textFrom(data.content ?? []);
-  // Never let an empty/failed extraction wipe a good prior summary.
-  return text || priorSummary;
+  // Empty extraction -> null ("no new summary produced"). The caller keeps the
+  // prior summary AND does not advance summarizedCount, so this batch is retried
+  // next time (rather than being marked folded into a summary that omitted it).
+  return text || null;
 }
 
 // --- Photo estimation for the Food tab's "Snap a meal" -------------------------

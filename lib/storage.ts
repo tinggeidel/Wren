@@ -76,27 +76,26 @@ export async function loadChat(): Promise<ChatStore> {
 }
 
 // Persist the chat. `messages` is the source of truth for the UI; `cont` carries
-// the optional conversation-continuity summary. When `cont` is omitted (the common
-// path — a normal send, photo, scan, kickoff, clear+reboot), we PRESERVE whatever
-// summary was already persisted by reading it back first, so a routine message save
-// never clobbers the running summary written by the (separate) summarization pass.
-// When `cont` IS provided (the summarization pass), the given values are written.
+// the conversation-continuity values (running summary + how many leading messages
+// are folded into it) and is REQUIRED — every caller passes the current in-memory
+// continuity values (summaryRef / summarizedCountRef in CoachScreen), which are the
+// synchronous source of truth (updated before each save). Because we ALWAYS write
+// exactly the passed values, there is NO read-modify-write here: a routine message
+// save and the (separate, async) summarization save can no longer interleave such
+// that one clobbers the other to a stale summary — each writes the latest refs.
 export async function saveChat(
   messages: ChatMessage[],
-  cont?: { summary: string; summarizedCount: number }
+  cont: { summary: string; summarizedCount: number }
 ): Promise<void> {
   // Drop base64 image data before persisting — it's large and only needed for the
   // live API call; the local imageUri is kept so the photo still renders on reload.
   const slim = messages.map(({ imageBase64, ...m }) => m);
-  let summary = cont?.summary ?? "";
-  let summarizedCount = cont?.summarizedCount ?? 0;
-  if (!cont) {
-    // Preserve the existing summary across an ordinary message save.
-    const existing = await loadChat();
-    summary = existing.summary ?? "";
-    summarizedCount = existing.summarizedCount ?? 0;
-  }
-  const payload: ChatStore = { lastDate: toISODate(new Date()), messages: slim, summary, summarizedCount };
+  const payload: ChatStore = {
+    lastDate: toISODate(new Date()),
+    messages: slim,
+    summary: cont.summary,
+    summarizedCount: cont.summarizedCount,
+  };
   await AsyncStorage.setItem(CHAT_KEY, JSON.stringify(payload));
 }
 

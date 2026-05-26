@@ -163,6 +163,14 @@ export default function CoachScreen({
       const start = summarizedCountRef.current;
       const batch = all.slice(start, start + toFold);
       const merged = await summarizeConversation(summaryRef.current, batch);
+      // null = the summarizer produced no new summary (empty/failed extraction).
+      // Do NOT advance summarizedCount or change the summary in that case, so this
+      // batch is retried next time rather than being marked folded into a summary
+      // that never actually included it. Empty extraction is rare, so retry is fine.
+      if (merged == null) return;
+      // Update the refs FIRST (synchronous source of truth), then persist with
+      // exactly those values — no read-modify-write, so a concurrent message save
+      // can't regress the summary (Fix A).
       summaryRef.current = merged;
       summarizedCountRef.current = start + toFold;
       // Persist the updated summary alongside the CURRENT message list (the ref,
@@ -522,7 +530,10 @@ export default function CoachScreen({
           { role: "assistant", content: reply, date: toISODate(new Date()) },
         ];
         appendMessages(appended);
-        await saveChat(appended);
+        await saveChat(appended, {
+          summary: summaryRef.current,
+          summarizedCount: summarizedCountRef.current,
+        });
       } catch {
         // leave existing messages; she can still type
       } finally {
@@ -571,7 +582,10 @@ export default function CoachScreen({
         ...crisisMsg,
       ];
       appendMessages(withReply);
-      await saveChat(withReply);
+      await saveChat(withReply, {
+        summary: summaryRef.current,
+        summarizedCount: summarizedCountRef.current,
+      });
       // Reply is persisted; now fold older messages into the rolling summary if
       // enough have aged out. Not awaited — it must not add latency to her next
       // message; it persists itself safely (single saveChat on the latest ref).
@@ -590,7 +604,10 @@ export default function CoachScreen({
         ...crisisMsg,
       ];
       appendMessages(withErr);
-      await saveChat(withErr);
+      await saveChat(withErr, {
+        summary: summaryRef.current,
+        summarizedCount: summarizedCountRef.current,
+      });
     } finally {
       setSending(false);
     }
@@ -637,7 +654,10 @@ export default function CoachScreen({
       // and here can't be clobbered when we persist.
       const next: ChatMessage[] = [...messagesRef.current, note];
       appendMessages(next);
-      await saveChat(next);
+      await saveChat(next, {
+        summary: summaryRef.current,
+        summarizedCount: summarizedCountRef.current,
+      });
       return;
     }
     const grams = hit.serving?.grams ?? 100;
@@ -716,7 +736,8 @@ export default function CoachScreen({
                 { role: "assistant", content: reply, date: toISODate(new Date()) },
               ];
               appendMessages(fresh);
-              await saveChat(fresh);
+              // The thread was just cleared; the rolling summary is reset too.
+              await saveChat(fresh, { summary: "", summarizedCount: 0 });
             } catch {
               // ignore
             } finally {

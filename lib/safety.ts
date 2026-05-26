@@ -93,8 +93,11 @@ const CRISIS_PATTERNS: RegExp[] = [
   /\b(?:throw|throwing|threw) up(?: again)? (?:after (?:i |my |every |each )?(?:eat|eating|meal|meals|food)|to (?:lose|get rid|avoid|undo)|on purpose|every time i eat)\b/,
   /\b(?:make myself |force myself to )?vomit (?:after (?:i |my |every |each )?(?:eat|eating|meal|meals|food)|to (?:lose|get rid|avoid|undo)|on purpose|every time i eat)\b/,
   /\bvomit (?:to lose weight|on purpose|to get rid of)\b/,
-  /\bto get rid of (?:the |what i (?:ate|eat)|the food|the calories|the meal)\b/,
-  /\bto undo (?:the |what i (?:ate|eat)|the food|the calories|the meal)\b/,
+  // Purge-intent objects only — food/calories/meal/"what I ate". The bare "the"
+  // branch was dropped: it matched benign phrases like "get rid of the clutter" or
+  // "undo the change". These still catch "to get rid of the food/calories" etc.
+  /\bto get rid of (?:what i (?:ate|eat)|the food|the calories|the meal)\b/,
+  /\bto undo (?:what i (?:ate|eat)|the food|the calories|the meal)\b/,
 
   // (b) ED behaviors — explicit deliberate starvation intent (not bare
   // "starving", which is hyperbole). Requires an intent/plan framing.
@@ -169,6 +172,15 @@ export function runSafetyAssertions(): string[] {
   // Benign "overdose" hyperbole -> false.
   must(!detectCrisisLanguage("I overdosed on caffeine this morning"), "overdose caffeine -> false");
   must(!detectCrisisLanguage("I think I overdosed on sugar at the party"), "overdose sugar -> false");
+
+  // Benign "get rid of the …" / "undo the …" -> false (the bare "the" branch was
+  // dropped so these no longer trip the purge-intent patterns).
+  must(!detectCrisisLanguage("I need to get rid of the clutter"), "get rid of clutter -> false");
+  must(!detectCrisisLanguage("let me undo the changes"), "undo the changes -> false");
+
+  // …but the real purge phrasings still trip.
+  must(detectCrisisLanguage("I want to get rid of the calories I ate"), "get rid of the calories -> true");
+  must(detectCrisisLanguage("is there a way to undo the meal I just had"), "undo the meal -> true");
 
   // NOTE: "I can't go on this diet anymore" intentionally resolves to TRUE — it
   // matches the bare "can t go on" pattern. This is an accepted gentle false
