@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
   View,
   Text,
@@ -97,6 +97,7 @@ export default function WorkoutScreen({
   profile,
   updateProfile,
   onOpenCoach,
+  openSetupSignal,
 }: {
   profile: Profile;
   // Shared updater (App.tsx): every transform runs against the LATEST profile,
@@ -104,6 +105,10 @@ export default function WorkoutScreen({
   // one silently clobbering the other.
   updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
   onOpenCoach: () => void;
+  // Counter bumped by App when onboarding finishes on the "create a workout plan"
+  // path. Each increment auto-opens the plan-setup sheet (see effect below) so she
+  // lands straight in setup. Optional so other callers/tests can omit it.
+  openSetupSignal?: number;
 }) {
   const today = toISODate(new Date());
   const phase = currentPhase(profile);
@@ -199,6 +204,18 @@ export default function WorkoutScreen({
     setGenError("");
     setSetupOpen(true);
   }
+
+  // Onboarding's "create a workout plan" path bumps openSetupSignal. On each new
+  // value (>0) make sure we're on the Plan sub-tab and open the same setup sheet
+  // the no-plan CTA opens, so she lands straight in plan setup. Guard the initial
+  // 0 so a normal mount never auto-opens. Disable the exhaustive-deps lint: this
+  // must fire ONLY when the signal changes, not when openPlanSetup's closure does.
+  useEffect(() => {
+    if (!openSetupSignal) return;
+    setActiveTab("plan");
+    openPlanSetup();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSetupSignal]);
 
   function toggleAccess(key: string) {
     setSpAccess((a) => (a.includes(key) ? a.filter((x) => x !== key) : [...a, key]));

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   View,
   Text,
@@ -8,6 +8,8 @@ import {
   ScrollView,
   StyleSheet,
   Platform,
+  NativeSyntheticEvent,
+  NativeScrollEvent,
 } from "react-native";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import {
@@ -49,20 +51,126 @@ function parseDateOrToday(s: string): Date {
   return isNaN(d.getTime()) ? new Date() : d;
 }
 
+// Whole years between a birth date and today. Birthday-aware (not just a year
+// subtraction), so someone whose birthday hasn't happened yet this year reads as
+// one year younger. Result is clamped non-negative; callers guard the range.
+function ageFromBirthDate(birth: Date, now: Date): number {
+  let age = now.getFullYear() - birth.getFullYear();
+  const m = now.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && now.getDate() < birth.getDate())) age -= 1;
+  return Math.max(0, age);
+}
+
+// Default birth date for the picker: ~30 years ago. We DON'T pre-fill the age
+// field from this — age stays blank until she actually confirms a date — so a
+// skipped Body step never stores a value she didn't pick.
+function defaultBirthDate(): Date {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 30);
+  return d;
+}
+// Oldest allowed birth date: 100 years ago, to keep ages sane. Newest is today.
+function minBirthDate(): Date {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 100);
+  return d;
+}
+
+// --- Scroll-wheel picker (core RN only, no native dep) ---------------------
+// A vertical snap list: items are ITEM_H tall, with ITEM_H padding top+bottom so
+// the first/last value can center. The centered item (scroll offset / ITEM_H) is
+// the selection. onChange fires only on a real settle (momentum or drag end), so
+// programmatic/initial layout doesn't count as a user choice — the parent decides
+// "touched" from that.
+const ITEM_H = 40;
+const VISIBLE = 5; // odd, so there's a clear middle row
+const WHEEL_H = ITEM_H * VISIBLE;
+
+function WheelPicker({
+  values,
+  selectedIndex,
+  onChange,
+  labelFor,
+  width,
+}: {
+  values: number[];
+  selectedIndex: number;
+  onChange: (index: number) => void;
+  labelFor: (v: number) => string;
+  width?: number;
+}) {
+  const ref = useRef<ScrollView>(null);
+  // Initial scroll position so the selected value starts centered. We set it via
+  // contentOffset on mount; later programmatic corrections aren't needed because
+  // the parent drives selectedIndex and we only call onChange on settle.
+  const clamp = (i: number) => Math.max(0, Math.min(values.length - 1, i));
+
+  function settle(e: NativeSyntheticEvent<NativeScrollEvent>) {
+    const idx = clamp(Math.round(e.nativeEvent.contentOffset.y / ITEM_H));
+    if (idx !== selectedIndex) onChange(idx);
+    // Re-snap exactly in case the OS left us a hair off the grid.
+    ref.current?.scrollTo({ y: idx * ITEM_H, animated: true });
+  }
+
+  return (
+    <View style={[styles.wheel, width != null && { width }]}>
+      {/* Center selection band, drawn behind the items. */}
+      <View pointerEvents="none" style={styles.wheelBand} />
+      <ScrollView
+        ref={ref}
+        showsVerticalScrollIndicator={false}
+        snapToInterval={ITEM_H}
+        decelerationRate="fast"
+        contentOffset={{ x: 0, y: selectedIndex * ITEM_H }}
+        onMomentumScrollEnd={settle}
+        onScrollEndDrag={settle}
+        contentContainerStyle={{ paddingVertical: (WHEEL_H - ITEM_H) / 2 }}
+      >
+        {values.map((v, i) => (
+          <View key={v} style={styles.wheelItem}>
+            <Text style={[styles.wheelText, i === selectedIndex && styles.wheelTextOn]}>
+              {labelFor(v)}
+            </Text>
+          </View>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+// Inclusive integer range helper for wheel value lists.
+function range(lo: number, hi: number): number[] {
+  const out: number[] = [];
+  for (let n = lo; n <= hi; n++) out.push(n);
+  return out;
+}
+
+// Height wheel options (US ft/in). Sensible human bounds.
+const FEET = range(4, 7);
+const INCHES = range(0, 11);
+// Weight wheel options (lb). Reasonable adult range.
+const WEIGHTS = range(80, 350);
+
 // The lean step list. Body stats, cycle, and diet are all skippable — the app and
 // Coach already tolerate missing fields, and the Coach can ask for stats later.
-const STEPS = ["welcome", "basics", "body", "cycle", "diet", "tone"] as const;
+// "start" is the final fork: create a plan vs. chat with the Coach.
+const STEPS = ["welcome", "basics", "body", "cycle", "diet", "tone", "start"] as const;
 type Step = (typeof STEPS)[number];
+
+// Where she chose to begin after onboarding (drives App's tab + plan-setup auto-open).
+type StartDest = "coach" | "workout";
 
 export default function OnboardingScreen({
   // Builds the very first Profile from scratch and persists it (App.initProfile),
   // exactly like the old Settings-as-onboarding path did — same shape, no widening.
   initProfile,
-  // Navigation-only side effect after completion (jump to the Coach tab).
+  // Navigation-only side effect after completion. The destination she picked on
+  // the final step decides whether App lands on the Coach tab (default) or the
+  // Workout tab with plan-setup auto-opened.
   onDone,
 }: {
   initProfile: (p: Profile) => Promise<void>;
-  onDone: () => void;
+  onDone: (dest: StartDest) => void;
 }) {
   const [stepIndex, setStepIndex] = useState(0);
   const step: Step = STEPS[stepIndex];
@@ -82,7 +190,28 @@ export default function OnboardingScreen({
   const [dietChips, setDietChips] = useState<string[]>([]);
   const [dietNotes, setDietNotes] = useState("");
   const [tone, setTone] = useState<Tone>("bestie");
+  const [startDest, setStartDest] = useState<StartDest>("coach");
   const [saving, setSaving] = useState(false);
+
+  // Birth-date picker state. We keep the picked Date in local state for the
+  // calendar to display, but only write the COMPUTED whole-year age into the
+  // existing string `age` field (the BMR math parses that). `age` stays "" until
+  // she confirms a date, so a skipped Body step never stores a default she didn't
+  // choose. `birthDate` is local-only — not persisted, not added to the Profile.
+  const [birthDate, setBirthDate] = useState<Date>(defaultBirthDate);
+  const [showBirthPicker, setShowBirthPicker] = useState(false);
+
+  // Body wheels: indices into the option lists. Defaults point at sensible middle
+  // values (5'6", 150 lb) for a friendly starting position, but they only get
+  // written into height/weight once she actually touches a wheel — tracked here.
+  const [feetIdx, setFeetIdx] = useState(() => FEET.indexOf(5));
+  const [inchIdx, setInchIdx] = useState(() => INCHES.indexOf(6));
+  const [heightTouched, setHeightTouched] = useState(false);
+  const [weightIdx, setWeightIdx] = useState(() => {
+    const i = WEIGHTS.indexOf(150);
+    return i >= 0 ? i : 0;
+  });
+  const [weightTouched, setWeightTouched] = useState(false);
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -94,8 +223,44 @@ export default function OnboardingScreen({
     if (event.type === "set" && date) setLastPeriodStart(toISODate(date));
   }
 
+  // Birth-date picker handlers. On confirm we compute + store the age string only;
+  // on Android the picker is a one-shot dialog (it dismisses itself) so we confirm
+  // on "set"; on iOS the inline picker stays open and a Done button confirms.
+  function applyBirthDate(d: Date) {
+    setBirthDate(d);
+    setAge(String(ageFromBirthDate(d, new Date())));
+  }
+  function onChangeBirthDate(event: DateTimePickerEvent, date?: Date) {
+    if (Platform.OS === "android") {
+      setShowBirthPicker(false);
+      if (event.type === "set" && date) applyBirthDate(date);
+      return;
+    }
+    // iOS inline: reflect the spin live; the field is set when she taps Done.
+    if (date) setBirthDate(date);
+  }
+
   function toggleDietChip(key: string) {
     setDietChips((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  }
+
+  // Wheel change handlers also fold the new selection into the height/weight
+  // strings in the SAME formats the existing parsers consume (parseHeightCm:
+  // 5'6"; parseWeightKg: 150 lb). Marking touched lets a skipped step stay blank.
+  function onFeet(i: number) {
+    setFeetIdx(i);
+    setHeightTouched(true);
+    setHeight(`${FEET[i]}'${INCHES[inchIdx]}"`);
+  }
+  function onInch(i: number) {
+    setInchIdx(i);
+    setHeightTouched(true);
+    setHeight(`${FEET[feetIdx]}'${INCHES[i]}"`);
+  }
+  function onWeight(i: number) {
+    setWeightIdx(i);
+    setWeightTouched(true);
+    setWeight(`${WEIGHTS[i]} lb`);
   }
 
   const isLast = stepIndex === STEPS.length - 1;
@@ -167,11 +332,11 @@ export default function OnboardingScreen({
       for (const f of facts) profile = addMemory(profile, f);
 
       await initProfile(profile);
-      onDone();
+      onDone(startDest);
     } catch {
       // A persist failure must not strand her on onboarding. initProfile already
       // updated the in-memory profile synchronously before its await, so move on.
-      onDone();
+      onDone(startDest);
     } finally {
       setSaving(false);
     }
@@ -252,28 +417,84 @@ export default function OnboardingScreen({
               Coach can ask later.
             </Text>
 
-            <Text style={styles.label}>Age</Text>
-            <TextInput
-              style={styles.input}
-              value={age}
-              onChangeText={setAge}
-              placeholder="e.g. 31"
-              keyboardType="number-pad"
-            />
+            <Text style={styles.label}>Date of birth</Text>
+            {Platform.OS === "android" ? (
+              // Android: a tappable field that opens the system date dialog (one-shot).
+              <TouchableOpacity style={styles.input} onPress={() => setShowBirthPicker(true)}>
+                <Text style={age ? styles.dobValue : styles.dobPlaceholder}>
+                  {age ? `${birthDate.toLocaleDateString()} · age ${age}` : "Tap to choose your birth date"}
+                </Text>
+              </TouchableOpacity>
+            ) : (
+              // iOS: inline spinner (same pattern Settings/plan use), confirmed by Done.
+              <TouchableOpacity style={styles.input} onPress={() => setShowBirthPicker((s) => !s)}>
+                <Text style={age ? styles.dobValue : styles.dobPlaceholder}>
+                  {age ? `${birthDate.toLocaleDateString()} · age ${age}` : "Tap to choose your birth date"}
+                </Text>
+              </TouchableOpacity>
+            )}
+            {showBirthPicker && (
+              <View>
+                <DateTimePicker
+                  value={birthDate}
+                  mode="date"
+                  display={Platform.OS === "ios" ? "spinner" : "default"}
+                  maximumDate={new Date()}
+                  minimumDate={minBirthDate()}
+                  onChange={onChangeBirthDate}
+                />
+                {Platform.OS === "ios" && (
+                  <TouchableOpacity
+                    style={styles.doneBtn}
+                    onPress={() => {
+                      applyBirthDate(birthDate);
+                      setShowBirthPicker(false);
+                    }}
+                  >
+                    <Text style={styles.doneBtnText}>Done</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            )}
+
             <Text style={styles.label}>Height</Text>
-            <TextInput
-              style={styles.input}
-              value={height}
-              onChangeText={setHeight}
-              placeholder={"e.g. 5'6\" or 168 cm"}
-            />
+            <View style={styles.wheelRow}>
+              <View style={styles.wheelGroup}>
+                <WheelPicker
+                  values={FEET}
+                  selectedIndex={feetIdx}
+                  onChange={onFeet}
+                  labelFor={(v) => `${v} ft`}
+                />
+              </View>
+              <View style={styles.wheelGroup}>
+                <WheelPicker
+                  values={INCHES}
+                  selectedIndex={inchIdx}
+                  onChange={onInch}
+                  labelFor={(v) => `${v} in`}
+                />
+              </View>
+            </View>
+            <Text style={styles.hint}>
+              {heightTouched ? `Set to ${FEET[feetIdx]}'${INCHES[inchIdx]}".` : "Scroll to set your height — or skip."}
+            </Text>
+
             <Text style={styles.label}>Weight</Text>
-            <TextInput
-              style={styles.input}
-              value={weight}
-              onChangeText={setWeight}
-              placeholder="e.g. 140 lb or 64 kg"
-            />
+            <View style={styles.wheelRow}>
+              <View style={styles.wheelGroupWide}>
+                <WheelPicker
+                  values={WEIGHTS}
+                  selectedIndex={weightIdx}
+                  onChange={onWeight}
+                  labelFor={(v) => `${v} lb`}
+                />
+              </View>
+            </View>
+            <Text style={styles.hint}>
+              {weightTouched ? `Set to ${WEIGHTS[weightIdx]} lb.` : "Scroll to set your weight — or skip."}
+            </Text>
+
             <Text style={styles.label}>Activity level</Text>
             <View style={styles.chipWrap}>
               {ACTIVITIES.map((a) => (
@@ -424,6 +645,41 @@ export default function OnboardingScreen({
             </Text>
           </View>
         )}
+
+        {step === "start" && (
+          <View>
+            <Text style={styles.title}>How do you want to start?</Text>
+            <Text style={styles.subtitle}>
+              Either way you're all set up — pick whatever feels right. You can always do the other
+              one later.
+            </Text>
+
+            <TouchableOpacity
+              style={[styles.startCard, startDest === "workout" && styles.startCardOn]}
+              onPress={() => setStartDest("workout")}
+            >
+              <Text style={[styles.startCardTitle, startDest === "workout" && styles.startCardTitleOn]}>
+                🏋️ Create my workout plan
+              </Text>
+              <Text style={[styles.startCardText, startDest === "workout" && styles.startCardTextOn]}>
+                Your Coach builds a week of training around your goal and cycle. We'll take you
+                straight to set it up.
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.startCard, startDest === "coach" && styles.startCardOn]}
+              onPress={() => setStartDest("coach")}
+            >
+              <Text style={[styles.startCardTitle, startDest === "coach" && styles.startCardTitleOn]}>
+                💬 Chat with my coach
+              </Text>
+              <Text style={[styles.startCardText, startDest === "coach" && styles.startCardTextOn]}>
+                Just talk — ask anything, log how you feel, or get a plan whenever you're ready.
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </ScrollView>
 
       {/* Sticky footer nav: Back, optional Skip on skippable steps, and Next. */}
@@ -438,7 +694,13 @@ export default function OnboardingScreen({
 
         <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving}>
           <Text style={styles.nextBtnText}>
-            {isLast ? (saving ? "Setting up…" : "Meet your Coach") : "Next"}
+            {isLast
+              ? saving
+                ? "Setting up…"
+                : startDest === "workout"
+                  ? "Build my plan"
+                  : "Meet your Coach"
+              : "Next"}
           </Text>
         </TouchableOpacity>
       </View>
@@ -468,6 +730,9 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     fontSize: 16,
   },
+  // Date-of-birth pseudo-input (a TouchableOpacity styled like `input`).
+  dobValue: { fontSize: 16, color: "#1a1a1a" },
+  dobPlaceholder: { fontSize: 16, color: "#999" },
   multiline: { minHeight: 70, textAlignVertical: "top" },
   chipWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 6 },
   chip: {
@@ -481,6 +746,33 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 14, color: "#333" },
   chipTextActive: { color: "#fff", fontWeight: "600" },
   hint: { fontSize: 13, color: "#666", marginTop: 10, lineHeight: 18 },
+  // Scroll-wheel pickers (height ft/in, weight lb).
+  wheelRow: { flexDirection: "row", gap: 12, marginTop: 6 },
+  wheelGroup: { flex: 1 },
+  wheelGroupWide: { flex: 1 },
+  wheel: {
+    height: WHEEL_H,
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 10,
+    overflow: "hidden",
+    backgroundColor: "#fafafa",
+    justifyContent: "center",
+  },
+  wheelBand: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: (WHEEL_H - ITEM_H) / 2,
+    height: ITEM_H,
+    backgroundColor: "#f0eef7",
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: "#e0d8f5",
+  },
+  wheelItem: { height: ITEM_H, alignItems: "center", justifyContent: "center" },
+  wheelText: { fontSize: 17, color: "#aaa" },
+  wheelTextOn: { color: "#1a1a1a", fontWeight: "700", fontSize: 18 },
   switchRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -500,6 +792,19 @@ const styles = StyleSheet.create({
   calendarBtnText: { fontSize: 18 },
   doneBtn: { alignSelf: "flex-end", paddingVertical: 8, paddingHorizontal: 12 },
   doneBtnText: { color: ACCENT, fontWeight: "700", fontSize: 15 },
+  // Final "how to start" choice cards.
+  startCard: {
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 14,
+    padding: 16,
+    marginTop: 14,
+  },
+  startCardOn: { borderColor: ACCENT, backgroundColor: "#f0eef7" },
+  startCardTitle: { fontSize: 17, fontWeight: "700", color: "#1a1a1a" },
+  startCardTitleOn: { color: ACCENT },
+  startCardText: { fontSize: 14, color: "#666", marginTop: 6, lineHeight: 20 },
+  startCardTextOn: { color: "#555" },
   footer: {
     flexDirection: "row",
     alignItems: "center",

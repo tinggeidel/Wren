@@ -46,6 +46,10 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [tab, setTab] = useState<Tab>("coach");
+  // Bumped when onboarding finishes on the "create a workout plan" path. The
+  // Workout tab watches this counter and auto-opens its plan-setup sheet — a
+  // counter (not a boolean) so a later re-trigger always fires the effect.
+  const [planSetupSignal, setPlanSetupSignal] = useState(0);
 
   // SINGLE source of truth for the live profile. Every persistence path (Coach
   // tools AND all screens) routes through updateProfile, which always applies the
@@ -130,10 +134,24 @@ export default function App() {
           // First run: the guided onboarding flow, no tabs until there's a profile.
           // It builds the complete first Profile from scratch (same documented
           // shape — no widening) and persists it via initProfile, which makes it the
-          // single source of truth, then lands on the Coach tab. Returning users
+          // single source of truth, then lands on the chosen tab. Returning users
           // (a stored profile exists) skip this entirely; Settings (the gear) stays
           // the place to edit the profile later.
-          <OnboardingScreen initProfile={initProfile} onDone={() => setTab("coach")} />
+          //
+          // onDone receives where she chose to start: "coach" (default) or
+          // "workout". For "workout" we land on the Workout tab AND bump
+          // planSetupSignal so that screen auto-opens its plan-setup sheet.
+          <OnboardingScreen
+            initProfile={initProfile}
+            onDone={(dest) => {
+              if (dest === "workout") {
+                setTab("workout");
+                setPlanSetupSignal((n) => n + 1);
+              } else {
+                setTab("coach");
+              }
+            }}
+          />
         ) : (
           <View style={styles.flex}>
             {/* All screens stay mounted; inactive ones are hidden so the Coach's
@@ -157,6 +175,7 @@ export default function App() {
                   profile={profile}
                   updateProfile={updateProfile}
                   onOpenCoach={() => setTab("coach")}
+                  openSetupSignal={planSetupSignal}
                 />
               </View>
               <View style={tab === "progress" ? styles.flex : styles.hidden}>
