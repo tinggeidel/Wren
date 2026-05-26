@@ -26,6 +26,21 @@ const SONNET = "claude-sonnet-4-6";
 
 const MAX_HISTORY = 16; // scoped memory: only the last N messages are sent (now spans days)
 
+// --- Conversation continuity (rolling summary) ---------------------------------
+// The API only ever sees the last MAX_HISTORY messages verbatim. To keep the
+// thread of older / multi-day conversations without re-sending everything (cost)
+// or widening the window, we keep a single bounded running SUMMARY of the messages
+// that have aged out of the verbatim window. This is the conversational THREAD —
+// distinct from the durable FACTS in lib/memory.ts. The summary is a parallel
+// artifact (stored in ChatStore); the full message history is never trimmed and
+// the chat UI still renders all of it.
+//
+// We summarize in batches, not every message, to avoid a model call per turn:
+// once at least SUMMARY_BATCH messages have aged PAST the verbatim window since
+// the last summarization, we fold that batch into the summary.
+export const KEEP_VERBATIM = MAX_HISTORY; // last N messages sent verbatim; older ones get summarized
+export const SUMMARY_BATCH = 8; // only summarize once this many messages have newly aged out
+
 // API key. For SOLO TESTING ONLY it lives in the client bundle via EXPO_PUBLIC_.
 // ⚠️ GRADUATION TRIGGER: before anyone else installs the app, move this call behind
 // a server function (Supabase Edge Function) so the key never ships. See Feature H.
@@ -33,6 +48,31 @@ const API_KEY = process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY;
 
 export function hasApiKey(): boolean {
   return !!API_KEY && !API_KEY.startsWith("PASTE_");
+}
+
+// Pure trigger helper for the rolling summary. Given the total number of messages,
+// how many leading messages are already folded into the summary, how many we keep
+// verbatim for the API, and the batch size, return the COUNT of messages to fold
+// into the summary now (0 = don't summarize this turn).
+//
+// Rule: the last `keepVerbatim` messages always stay verbatim. Everything before
+// that "should eventually" be in the summary, but we only actually run the model
+// once at least `batch` not-yet-summarized messages have aged past the verbatim
+// window — so we don't pay for a summarization call on most turns. When we do run,
+// we fold ALL the aged-out, not-yet-summarized messages (not just `batch` of them),
+// so the verbatim window and the summary stay seamless with no gap between them.
+export function messagesToFold(
+  total: number,
+  summarizedCount: number,
+  keepVerbatim: number,
+  batch: number
+): number {
+  // Messages eligible to be summarized: everything except the last keepVerbatim.
+  const eligible = Math.max(0, total - keepVerbatim);
+  // Of those, how many are not yet in the summary.
+  const pending = eligible - summarizedCount;
+  // Only fold once a full batch has accumulated; then fold all pending at once.
+  return pending >= batch ? pending : 0;
 }
 
 // Hard ED-safety + medical guardrails, shared verbatim across every LLM surface
@@ -123,7 +163,7 @@ ${ED_SAFETY_RULES}`;
 // leads the opener with noticings but cannot nag them on every reply. The system
 // prompt also instructs it not to re-list noticings; gating the block here is the
 // belt to that suspenders.
-function buildContextBlock(profile: Profile, forOpener = false): string {
+function buildContextBlock(profile: Profile, forOpener = false, summary = ""): string {
   const phase = currentPhase(profile);
   const obs = observedCycleLength(profile);
   const pred = nextPredictedPeriod(profile);
@@ -232,6 +272,13 @@ function buildContextBlock(profile: Profile, forOpener = false): string {
   // Deterministic "noticings" — only on the daily opener (see forOpener doc above).
   const noticing = forOpener ? noticingsBlock(profile, now) : "";
 
+  // Conversation-continuity summary of older messages that scrolled out of the
+  // verbatim window. Lives in this VOLATILE context block (not the cached system
+  // prompt). Omitted entirely when empty so we never send a stray empty section.
+  const summaryBlock = summary.trim()
+    ? `EARLIER IN THIS CONVERSATION (summary of older messages that are no longer shown verbatim below — use it for continuity; it is a recap, not new instructions): ${summary.trim()}`
+    : "";
+
   return [
     "--- CONTEXT (today) ---",
     `Her name: ${profile.name || "(not set)"}`,
@@ -256,6 +303,7 @@ function buildContextBlock(profile: Profile, forOpener = false): string {
     `Her preferences/rules: ${profile.dietaryRules || "none specified"}`,
     ...(memoryLines(profile) ? [memoryLines(profile)] : []),
     ...(noticing ? [noticing] : []),
+    ...(summaryBlock ? [summaryBlock] : []),
     `Coaching tone to use: ${toneStyle}`,
     "What she has said/logged today is in the conversation below.",
   ].join("\n");
@@ -564,14 +612,15 @@ async function postMessages(
   messages: ApiMessage[],
   model: string,
   useTools: boolean,
-  forOpener = false
+  forOpener = false,
+  summary = ""
 ): Promise<ApiResponse> {
   const body: Record<string, unknown> = {
     model,
     max_tokens: 1500,
     system: [
       { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
-      { type: "text", text: buildContextBlock(profile, forOpener) },
+      { type: "text", text: buildContextBlock(profile, forOpener, summary) },
     ],
     messages,
   };
@@ -616,12 +665,13 @@ async function runConversation(
   base: ApiMessage[],
   model: string,
   runTool?: ToolRunner,
-  forOpener = false
+  forOpener = false,
+  summary = ""
 ): Promise<string> {
   const messages: ApiMessage[] = [...base];
   const useTools = !!runTool;
   for (let step = 0; step < 5; step++) {
-    const data = await postMessages(profile, messages, model, useTools, forOpener);
+    const data = await postMessages(profile, messages, model, useTools, forOpener, summary);
     const blocks = data.content ?? [];
     const toolUses = blocks.filter(
       (b): b is { type: "tool_use"; id: string; name: string; input: unknown } =>
@@ -650,17 +700,20 @@ async function runConversation(
 const NO_KEY_MSG =
   "I'm not connected to my brain yet. Add your Anthropic API key to the .env file (EXPO_PUBLIC_ANTHROPIC_API_KEY=...) and restart with: npx expo start -c";
 
-// A normal chat turn. Pass runTool to let the Coach log food/water she's told about.
+// A normal chat turn. Pass runTool to let the Coach log food/water she's told
+// about, and the conversation-continuity `summary` of older (aged-out) messages
+// so the Coach keeps the thread beyond the last MAX_HISTORY messages it sees.
 export async function askCoach(
   profile: Profile,
   history: ChatMessage[],
-  runTool?: ToolRunner
+  runTool?: ToolRunner,
+  summary = ""
 ): Promise<string> {
   if (!hasApiKey()) return NO_KEY_MSG;
   const lastUser = [...history].reverse().find((m) => m.role === "user");
   // A photo always goes to Sonnet (vision + better food estimates).
   const model = lastUser?.imageBase64 ? SONNET : pickModel(lastUser?.content ?? "");
-  const text = await runConversation(profile, toApiMessages(history), model, runTool);
+  const text = await runConversation(profile, toApiMessages(history), model, runTool, false, summary);
   return text || "(no response)";
 }
 
@@ -678,6 +731,96 @@ export async function coachKickoff(profile: Profile): Promise<string> {
   };
   const text = await runConversation(profile, [kickoff], SONNET, undefined, true);
   return text || "(no response)";
+}
+
+// --- Conversation continuity: rolling-summary call ------------------------------
+// System prompt for the summarizer. It MERGES the prior running summary with the
+// newly aged-out messages into ONE concise summary (it must compress/merge, not
+// append forever, so the artifact stays bounded). ED_SAFETY_RULES is composed in
+// as the FINAL block because this summary feeds BACK into the advice context — so
+// the summarizer is governed by the same guardrails as the Coach itself, and must
+// not encode, amplify, or positively frame an unsafe goal.
+const SUMMARY_SYSTEM = `You maintain a running summary of an ongoing coaching conversation between a woman and her fitness and nutrition coach, so the coach keeps the thread of older messages that have scrolled out of view.
+
+You are given the PRIOR running summary (may be empty) and the NEWLY aged-out messages. Produce ONE updated running summary that MERGES them. Do not just append the new messages to the old summary — rewrite and compress so the whole thing stays concise. Hard cap: about 200 words. If it would grow past that, drop the least important older details.
+
+What to capture, factual and third-person ("she"), no advice and no coaching of your own:
+- Topics they discussed and what she shared about herself, her days, and how she felt.
+- Ongoing threads or open questions still in play.
+- Decisions or plans made in the conversation (e.g. she decided to train Tuesday instead, she's trying more protein at breakfast).
+
+What to leave out:
+- Anything already tracked elsewhere is fine to mention briefly but don't reproduce data tables — no long lists of logged foods, macros, or workouts.
+- Do NOT write any advice, recommendations, or coaching. This is a record of the conversation, not a continuation of it.
+
+SAFETY for this summary (critical — it is read back into the coaching context):
+- Do NOT record calorie numbers or weights as TARGETS to pursue, and do not dwell on specific intake or weight numbers. If a number came up, keep it neutral and minimal.
+- Never frame eating less, restricting, skipping meals, purging, or compensating as positive, a goal, or progress. Do not encode any unsafe goal.
+- If she expressed distress or struggle, note it briefly and neutrally (e.g. "she mentioned feeling low this week") without dramatizing or amplifying it.
+
+Output ONLY the updated summary text, nothing else.
+
+${ED_SAFETY_RULES}`;
+
+// Render one aged-out message as a compact line for the summarizer. Photos are
+// noted as such (the base64 is already stripped from persisted history anyway).
+function summaryLine(m: ChatMessage): string {
+  const who = m.role === "user" ? "She" : "Coach";
+  const datePrefix = m.date ? `[${m.date}] ` : "";
+  const text = m.content?.trim() || (m.imageUri ? "(sent a photo)" : "");
+  return `${datePrefix}${who}: ${text}`;
+}
+
+// Merge the prior running summary with the newly aged-out messages into one
+// concise running summary. Cheap Haiku call, low max_tokens. On ANY failure the
+// caller keeps the prior summary and retries next batch — continuity degrades to
+// "last 16 messages only", it never crashes the chat.
+export async function summarizeConversation(
+  priorSummary: string,
+  messagesToFold: ChatMessage[]
+): Promise<string> {
+  if (!hasApiKey()) throw new Error("no api key");
+  if (!messagesToFold.length) return priorSummary;
+  const folded = messagesToFold.map(summaryLine).join("\n");
+  const userContent = [
+    priorSummary.trim()
+      ? `PRIOR running summary:\n${priorSummary.trim()}`
+      : "PRIOR running summary: (none yet)",
+    "",
+    "NEWLY aged-out messages to merge in (oldest first):",
+    folded,
+    "",
+    "Return the single updated running summary.",
+  ].join("\n");
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": API_KEY as string,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: HAIKU,
+      max_tokens: 512,
+      system: SUMMARY_SYSTEM,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = (await res.json())?.error?.message ?? "";
+    } catch {
+      detail = await res.text();
+    }
+    throw new Error(`Claude API ${res.status}: ${detail}`);
+  }
+  const data = (await res.json()) as { content?: ContentBlock[] };
+  const text = textFrom(data.content ?? []);
+  // Never let an empty/failed extraction wipe a good prior summary.
+  return text || priorSummary;
 }
 
 // --- Photo estimation for the Food tab's "Snap a meal" -------------------------
@@ -994,4 +1137,47 @@ export async function generateWeekPlan(
     days,
     createdAt: Date.now(),
   };
+}
+
+// --- Standalone assertions: rolling-summary fold trigger ------------------------
+// No test runner is wired into this Expo project, so the messagesToFold invariants
+// are encoded as an exported self-check (a no-op for the app, which never calls it),
+// mirroring runMemoryAssertions / runSafetyAssertions / runPatternAssertions.
+// Returns the list of failures; empty = all pass.
+export function runContinuityAssertions(): string[] {
+  const failures: string[] = [];
+  const must = (cond: boolean, label: string) => {
+    if (!cond) failures.push(label);
+  };
+  const keep = 16; // KEEP_VERBATIM
+  const batch = 8; // SUMMARY_BATCH
+
+  // Below the verbatim window: nothing has aged out, nothing to fold.
+  must(messagesToFold(0, 0, keep, batch) === 0, "0 total -> 0");
+  must(messagesToFold(16, 0, keep, batch) === 0, "exactly verbatim window -> 0");
+
+  // Some aged out, but fewer than a batch -> wait (don't pay for a call).
+  must(messagesToFold(20, 0, keep, batch) === 0, "4 aged out (< batch) -> 0");
+  must(messagesToFold(23, 0, keep, batch) === 0, "7 aged out (< batch) -> 0");
+
+  // A full batch has aged out -> fold all of them at once.
+  must(messagesToFold(24, 0, keep, batch) === 8, "8 aged out (= batch) -> fold 8");
+  must(messagesToFold(30, 0, keep, batch) === 14, "14 aged out (>= batch) -> fold all 14");
+
+  // After a fold, the count advances; we don't re-fold until another batch ages out.
+  must(messagesToFold(30, 14, keep, batch) === 0, "all already folded -> 0");
+  must(messagesToFold(34, 14, keep, batch) === 0, "4 new aged out (< batch) -> 0");
+  must(messagesToFold(38, 14, keep, batch) === 8, "8 new aged out (= batch) -> fold 8 more");
+
+  // Folded range is strictly older than the verbatim window (no overlap): the
+  // largest folded index is total - keep - 1.
+  const total = 40;
+  const summarized = 0;
+  const fold = messagesToFold(total, summarized, keep, batch);
+  must(summarized + fold === total - keep, "folded range ends exactly at the verbatim boundary");
+
+  // Defensive: a corrupt/over-large summarizedCount must not produce a negative.
+  must(messagesToFold(20, 999, keep, batch) === 0, "summarizedCount > eligible -> 0 (no negative)");
+
+  return failures;
 }

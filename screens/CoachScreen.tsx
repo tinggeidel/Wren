@@ -31,6 +31,10 @@ import { currentPhase, toISODate, cycleStarts } from "../lib/cycle";
 import {
   askCoach,
   coachKickoff,
+  summarizeConversation,
+  messagesToFold,
+  KEEP_VERBATIM,
+  SUMMARY_BATCH,
   ToolRunner,
   LogFoodArgs,
   LogWaterArgs,
@@ -121,6 +125,54 @@ export default function CoachScreen({
     messagesRef.current = next;
     setMessages(next);
   };
+
+  // Conversation-continuity state (the rolling summary of messages that have aged
+  // out of the last-MAX_HISTORY window the API sees). Held in refs so the send
+  // path can read the latest summary synchronously and the (async, non-blocking)
+  // summarization pass can build on current values without a stale render closure.
+  // Loaded from the persisted ChatStore on open; reset on Clear.
+  const summaryRef = useRef("");
+  const summarizedCountRef = useRef(0);
+  // Guards against two overlapping summarization passes (each is async and folds
+  // the same pending range) — only one runs at a time.
+  const summarizingRef = useRef(false);
+
+  // After a turn is delivered and saved, fold any aged-out messages into the
+  // rolling summary IF enough have accumulated (SUMMARY_BATCH). Runs without
+  // blocking her next message. Race-safety: the summary write rebuilds on
+  // messagesRef.current (the latest persisted list) and is a single saveChat with
+  // the cont payload, so it can't clobber messages that arrived meanwhile. On any
+  // error we keep the prior summary and try again next batch (continuity degrades
+  // to "last 16 only", never crashes).
+  async function maybeSummarize() {
+    if (summarizingRef.current) return;
+    const all = messagesRef.current;
+    const toFold = messagesToFold(
+      all.length,
+      summarizedCountRef.current,
+      KEEP_VERBATIM,
+      SUMMARY_BATCH
+    );
+    if (toFold <= 0) return;
+    summarizingRef.current = true;
+    try {
+      const start = summarizedCountRef.current;
+      const batch = all.slice(start, start + toFold);
+      const merged = await summarizeConversation(summaryRef.current, batch);
+      summaryRef.current = merged;
+      summarizedCountRef.current = start + toFold;
+      // Persist the updated summary alongside the CURRENT message list (the ref,
+      // which already includes anything appended while we were summarizing).
+      await saveChat(messagesRef.current, {
+        summary: summaryRef.current,
+        summarizedCount: summarizedCountRef.current,
+      });
+    } catch {
+      // Keep the prior summary + count; the next batch retries the same range.
+    } finally {
+      summarizingRef.current = false;
+    }
+  }
 
   // Latest profile, available synchronously inside the tool loop (where several
   // log_food calls may land in one turn before React re-renders).
@@ -424,6 +476,9 @@ export default function CoachScreen({
     loadChat().then(async (store) => {
       if (!active) return;
       appendMessages(store.messages);
+      // Restore the conversation-continuity summary so it enriches the first turn.
+      summaryRef.current = store.summary ?? "";
+      summarizedCountRef.current = store.summarizedCount ?? 0;
       const isNewDay = store.lastDate !== toISODate(new Date());
       const needKickoff = store.messages.length === 0 || isNewDay;
       if (!needKickoff) {
@@ -485,7 +540,7 @@ export default function CoachScreen({
       ? [{ role: "assistant", content: CRISIS_RESOURCES_MESSAGE, date: userMsg.date }]
       : [];
     try {
-      const reply = await askCoach(profileRef.current, next, runTool);
+      const reply = await askCoach(profileRef.current, next, runTool, summaryRef.current);
       const withReply: ChatMessage[] = [
         ...next,
         { role: "assistant", content: reply, date: userMsg.date },
@@ -493,6 +548,10 @@ export default function CoachScreen({
       ];
       appendMessages(withReply);
       await saveChat(withReply);
+      // Reply is persisted; now fold older messages into the rolling summary if
+      // enough have aged out. Not awaited — it must not add latency to her next
+      // message; it persists itself safely (single saveChat on the latest ref).
+      void maybeSummarize();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       const withErr: ChatMessage[] = [
@@ -623,6 +682,9 @@ export default function CoachScreen({
             if (sending || booting) return;
             await clearChat();
             appendMessages([]);
+            // Reset the rolling summary too — the thread it summarized is gone.
+            summaryRef.current = "";
+            summarizedCountRef.current = 0;
             setBooting(true);
             try {
               const reply = await coachKickoff(profile);
