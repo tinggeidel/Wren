@@ -95,6 +95,9 @@ export default function CoachScreen({
   const [sending, setSending] = useState(false);
   const [booting, setBooting] = useState(true);
   const [scanning, setScanning] = useState(false);
+  // Hide the suggested-prompt chips while the input is focused so the keyboard
+  // doesn't crowd the screen; they reappear on blur (keyboard dismissed).
+  const [inputFocused, setInputFocused] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
   // The Coach screen lives inside App's SafeAreaView (edges top+bottom), which
   // already reserves the top inset ABOVE this KeyboardAvoidingView. With
@@ -682,18 +685,20 @@ export default function CoachScreen({
         {sending && <ActivityIndicator style={styles.spinner} />}
       </ScrollView>
 
-      <View style={styles.suggestRow}>
-        {SUGGESTED.map((s) => (
-          <TouchableOpacity
-            key={s}
-            style={styles.chip}
-            onPress={() => send(s)}
-            disabled={sending || booting}
-          >
-            <Text style={styles.chipText}>{s}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
+      {!inputFocused && (
+        <View style={styles.suggestRow}>
+          {SUGGESTED.map((s) => (
+            <TouchableOpacity
+              key={s}
+              style={styles.chip}
+              onPress={() => send(s)}
+              disabled={sending || booting}
+            >
+              <Text style={styles.chipText}>{s}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
 
       <View style={styles.inputRow}>
         <TouchableOpacity
@@ -708,6 +713,8 @@ export default function CoachScreen({
           value={input}
           onChangeText={setInput}
           placeholder="Message your Coach…"
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
           onSubmitEditing={() => send(input)}
           returnKeyType="send"
         />
