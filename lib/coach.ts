@@ -17,6 +17,7 @@ import { consumedTotals, entriesFor, remaining, waterFor } from "./food";
 import { workoutsFor, workoutLabel, caloriesBurnedFor } from "./workouts";
 import { mondayOf, newId, targetForDate, planDayForDate } from "./plan";
 import { memoryLines } from "./memory";
+import { noticingsBlock } from "./patterns";
 
 // --- Models ---
 // Haiku for routine chat (cheap), Sonnet for complex coaching + the opener.
@@ -47,6 +48,16 @@ export const ED_SAFETY_RULES = `SAFETY (overrides everything, but does not make 
 - No supplement-by-name recommendations.
 - Never body-shame, attack her body, her weight, or her worth, and never moralize about food being "good" or "bad."
 - Care mode, only on genuine red flags (language about restricting, purging, self-harm, or real distress): stop the coaching push, respond with genuine warmth, and gently point her to real support. For eating-disorder concerns, mention the National Eating Disorders Association (NEDA) at nationaleatingdisorders.org or texting "NEDA" to 741741. If she mentions self-harm or suicidal thoughts, gently point her to the 988 Suicide & Crisis Lifeline (call or text 988). Do not trigger this for a normal bad day or an off-hand comment.`;
+
+// ED-safety guardrail specific to PROACTIVE noticing. This is its own block,
+// composed alongside ED_SAFETY_RULES (which still ends the system prompt). It
+// constrains what the Coach is allowed to bring up unprompted: proactivity must
+// stay about energy, fueling enough, recovery, consistency, cycle, and how she
+// feels — never policing intake amount or commenting on weight/scale progress.
+export const PROACTIVE_ED_SAFETY = `PROACTIVE NOTICING — ED-SAFETY (applies whenever you bring something up on your own, before she asks):
+- Proactive noticing stays about her ENERGY, fueling ENOUGH, recovery, training CONSISTENCY, her CYCLE, and how she FEELS — never about how much she ate.
+- NEVER proactively police her intake or call out an amount ("you only ate X calories", "you're under today"), and NEVER proactively comment on her weight, the scale, or weight-loss "progress." Those are not things you notice for her.
+- Never shame her and never frame eating less as a good thing. If a pattern (low energy, hard training) suggests she may be UNDER-fueling, nudge her gently toward eating ENOUGH to support her body — never toward eating less.`;
 
 // Static persona + guardrails. Authoritative, human voice, decoupled safety.
 const SYSTEM_PROMPT = `You are the Flux Coach: an expert, real fitness and nutrition coach for women who train with their cycle. Many of your users are not gym or nutrition people. They came here for a guide who tells them what to do, not a chatbot that makes them figure it out.
@@ -95,10 +106,24 @@ LONG-TERM MEMORY:
 - Use the forget_fact tool when something changes or was wrong, so you can self-correct (e.g. she healed an injury, or stopped a restriction). Same rule: only the tool changes anything; saying "I'll forget that" without calling forget_fact does nothing.
 - ED-SAFETY (critical): never store a specific goal weight or a calorie number as a target to pursue, and never store restrictive or compensatory intentions, or body-shaming self-talk, as facts to act on. The SAFETY rules below still govern everything; memory must never be used to encode, remember toward, or optimize for an unsafe goal.
 
+PROACTIVE / NOTICING:
+- The context may include a "WHAT TO NOTICE TODAY" block: short, factual signals computed in code from her real logged data (energy, recurring symptoms, cycle timing, workout consistency). Treat these like her macros — they are given to you, you present them, you never invent your own trend.
+- On the DAILY OPENER, LEAD with the 1-2 most relevant noticings, in your own voice, tied to today (her cycle phase, energy, this week's plan, what you remember about her). Pick what actually matters most right now — do NOT list everything, do NOT recite them as data. Weave them into a warm, brief hello, then give her targets and the day's focus.
+- If a noticing is an honest one (missed workouts piling up), be honest about it the way a good coach is — name it plainly and offer the smallest real step — but never nag, never shame. If it's a win (a strong streak), acknowledge it genuinely.
+- Do NOT repeat the same noticings on every message. After the opener, only bring a noticing up again if it's genuinely relevant to what she just said. The opener leads; the rest of the conversation responds to her.
+
+${PROACTIVE_ED_SAFETY}
+
 ${ED_SAFETY_RULES}`;
 
 // Volatile per-request context (kept AFTER the cacheable system block).
-function buildContextBlock(profile: Profile): string {
+//
+// `forOpener` adds the deterministic "WHAT TO NOTICE TODAY" block. It is fed ONLY
+// on the daily opener (coachKickoff), never on normal chat turns — so the Coach
+// leads the opener with noticings but cannot nag them on every reply. The system
+// prompt also instructs it not to re-list noticings; gating the block here is the
+// belt to that suspenders.
+function buildContextBlock(profile: Profile, forOpener = false): string {
   const phase = currentPhase(profile);
   const obs = observedCycleLength(profile);
   const pred = nextPredictedPeriod(profile);
@@ -204,6 +229,9 @@ function buildContextBlock(profile: Profile): string {
         }`
       : "";
 
+  // Deterministic "noticings" — only on the daily opener (see forOpener doc above).
+  const noticing = forOpener ? noticingsBlock(profile, now) : "";
+
   return [
     "--- CONTEXT (today) ---",
     `Her name: ${profile.name || "(not set)"}`,
@@ -227,6 +255,7 @@ function buildContextBlock(profile: Profile): string {
     "To add a food, water, workout, or cycle check-in she mentions that is not already shown above, call the matching log tool (log_food / log_water / log_workout / log_checkin). The conversation may span days; a message starting with [YYYY-MM-DD] marks that day. Never invent consumed or remaining numbers beyond those given here.",
     `Her preferences/rules: ${profile.dietaryRules || "none specified"}`,
     ...(memoryLines(profile) ? [memoryLines(profile)] : []),
+    ...(noticing ? [noticing] : []),
     `Coaching tone to use: ${toneStyle}`,
     "What she has said/logged today is in the conversation below.",
   ].join("\n");
@@ -534,14 +563,15 @@ async function postMessages(
   profile: Profile,
   messages: ApiMessage[],
   model: string,
-  useTools: boolean
+  useTools: boolean,
+  forOpener = false
 ): Promise<ApiResponse> {
   const body: Record<string, unknown> = {
     model,
     max_tokens: 1500,
     system: [
       { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
-      { type: "text", text: buildContextBlock(profile) },
+      { type: "text", text: buildContextBlock(profile, forOpener) },
     ],
     messages,
   };
@@ -585,12 +615,13 @@ async function runConversation(
   profile: Profile,
   base: ApiMessage[],
   model: string,
-  runTool?: ToolRunner
+  runTool?: ToolRunner,
+  forOpener = false
 ): Promise<string> {
   const messages: ApiMessage[] = [...base];
   const useTools = !!runTool;
   for (let step = 0; step < 5; step++) {
-    const data = await postMessages(profile, messages, model, useTools);
+    const data = await postMessages(profile, messages, model, useTools, forOpener);
     const blocks = data.content ?? [];
     const toolUses = blocks.filter(
       (b): b is { type: "tool_use"; id: string; name: string; input: unknown } =>
@@ -633,16 +664,19 @@ export async function askCoach(
   return text || "(no response)";
 }
 
-// Proactive opener: greet + today's focus. No tools (nothing to log on a hello).
-// Runs when the chat is empty (first run, and fresh each new day).
+// Proactive opener: greet + lead with what you NOTICE, then today's focus. No
+// tools (nothing to log on a hello). Runs when the chat is empty (first run, and
+// fresh each new day). The context for this call includes the deterministic
+// "WHAT TO NOTICE TODAY" block (forOpener); the prompt's PROACTIVE / NOTICING
+// section tells the Coach to lead with the 1-2 most relevant of those.
 export async function coachKickoff(profile: Profile): Promise<string> {
   if (!hasApiKey()) return NO_KEY_MSG;
   const kickoff: ApiMessage = {
     role: "user",
     content:
-      "Kick us off for today in your tone: a short warm hello and one line on what to focus on today given my cycle phase and goal. Two or three sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up.",
+      "Kick us off for today in your tone. If WHAT TO NOTICE TODAY has anything, LEAD with the one or two most relevant noticings woven naturally into a warm hello (tie them to my cycle phase, energy, plan, or what you remember about me) — pick what matters most, don't list everything. If there's nothing notable, just a genuine hello. Then one line on what to focus on today given my cycle phase and goal. A few sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up.",
   };
-  const text = await runConversation(profile, [kickoff], SONNET);
+  const text = await runConversation(profile, [kickoff], SONNET, undefined, true);
   return text || "(no response)";
 }
 
