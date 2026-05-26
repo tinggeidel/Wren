@@ -8,7 +8,11 @@ import {
   ScrollView,
   StyleSheet,
   Platform,
+  Image,
+  Alert,
+  ActivityIndicator,
 } from "react-native";
+import * as ImagePicker from "expo-image-picker";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import {
   Profile,
@@ -21,6 +25,8 @@ import {
 } from "../lib/types";
 import { toISODate } from "../lib/cycle";
 import { addMemory } from "../lib/memory";
+import { toJpegBase64 } from "../lib/image";
+import { calibrateFromPhotos, hasApiKey } from "../lib/coach";
 
 // Reuse the exact same option ordering Settings uses, so the two screens never
 // drift. These are the only fields onboarding collects; everything else on the
@@ -173,10 +179,13 @@ function formatHeight(totalIn: number): string {
   return `${ft}'${inch}"`;
 }
 
-// The lean step list. Body stats, cycle, and diet are all skippable — the app and
-// Coach already tolerate missing fields, and the Coach can ask for stats later.
+// The lean step list. Body stats, cycle, diet, and photos are all skippable —
+// the app and Coach already tolerate missing fields, and the Coach can ask for
+// stats later. "photos" is an optional, ED-safety-bounded calibration step that
+// only seeds qualitative Coach memory facts; it never changes macros (see the
+// photos step body and lib/coach.ts calibrateFromPhotos for the safety contract).
 // "start" is the final fork: create a plan vs. chat with the Coach.
-const STEPS = ["welcome", "basics", "body", "cycle", "diet", "tone", "start"] as const;
+const STEPS = ["welcome", "basics", "body", "photos", "cycle", "diet", "tone", "start"] as const;
 type Step = (typeof STEPS)[number];
 
 // Where she chose to begin after onboarding (drives App's tab + plan-setup auto-open).
@@ -233,6 +242,22 @@ export default function OnboardingScreen({
   const [weightLb, setWeightLb] = useState(WEIGHT_DEFAULT_LB);
   const [weightTouched, setWeightTouched] = useState(false);
 
+  // Photo "calibration" step — strictly optional, use-then-discard.
+  // We hold the local URI (for the in-step thumbnail) and the base64 (for the
+  // single vision call). Both are CLEARED after the call so nothing about the
+  // photos is persisted to disk or the Profile — only the Coach's three short
+  // qualitative notes are seeded as durable memory facts. See lib/coach.ts
+  // calibrateFromPhotos for the safety contract (no numbers, no goal-weight,
+  // never overrides profile.goal, macros stay computed from stats + BMR floor).
+  const [currentUri, setCurrentUri] = useState<string | null>(null);
+  const [currentBase64, setCurrentBase64] = useState<string | null>(null);
+  const [goalUri, setGoalUri] = useState<string | null>(null);
+  const [goalBase64, setGoalBase64] = useState<string | null>(null);
+  const [calibrating, setCalibrating] = useState(false);
+  // Tracks the three facts seeded (if any) so we can show a brief confirm and so
+  // re-running calibration replaces rather than stacks. Local-only; not persisted.
+  const [calibratedFacts, setCalibratedFacts] = useState<string[]>([]);
+
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
     setShowPicker((s) => !s);
@@ -279,11 +304,118 @@ export default function OnboardingScreen({
     setWeight(`${next} lb`);
   }
 
+  // --- Photo step helpers ----------------------------------------------------
+  // Same image pipeline as the Coach + Food photo flows: ImagePicker for the
+  // picker, toJpegBase64 for the resized JPEG the vision API needs. We never
+  // persist either uri or base64 — they live in component state only.
+  async function pickPhoto(slot: "current" | "goal", source: "camera" | "library") {
+    try {
+      if (source === "camera") {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Camera access needed", "Allow camera access to add a photo.");
+          return;
+        }
+      }
+      const opts = { mediaTypes: "images" as const };
+      const res =
+        source === "camera"
+          ? await ImagePicker.launchCameraAsync(opts)
+          : await ImagePicker.launchImageLibraryAsync(opts);
+      if (res.canceled || !res.assets?.length) return;
+      const asset = res.assets[0];
+      let base64: string;
+      try {
+        base64 = await toJpegBase64(asset.uri);
+      } catch {
+        Alert.alert("Couldn't read that photo", "Try another one.");
+        return;
+      }
+      if (slot === "current") {
+        setCurrentUri(asset.uri);
+        setCurrentBase64(base64);
+      } else {
+        setGoalUri(asset.uri);
+        setGoalBase64(base64);
+      }
+    } catch (e: unknown) {
+      Alert.alert("Photo error", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function offerPickPhoto(slot: "current" | "goal") {
+    Alert.alert(
+      slot === "current" ? "Add a photo of you now" : "Add a photo of where you want to go",
+      "Optional — you can always skip.",
+      [
+        { text: "Take photo", onPress: () => void pickPhoto(slot, "camera") },
+        { text: "Choose from library", onPress: () => void pickPhoto(slot, "library") },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  }
+
+  function removePhoto(slot: "current" | "goal") {
+    if (slot === "current") {
+      setCurrentUri(null);
+      setCurrentBase64(null);
+    } else {
+      setGoalUri(null);
+      setGoalBase64(null);
+    }
+  }
+
+  // Run the calibration. ALWAYS resolves — never throws to the caller — because
+  // onboarding must always complete. Drops the base64 either way (use-then-
+  // discard). On success, returns the three short facts to be seeded into Coach
+  // memory at finish(). On failure (network/API/parse/no key/no photos), returns
+  // [] so we soft-skip silently.
+  async function runCalibration(): Promise<string[]> {
+    const cur = currentBase64;
+    const dst = goalBase64;
+    // Always drop the base64 from state after the call — use-then-discard.
+    // We do this BEFORE the await so even a navigation interrupt can't leak it.
+    setCurrentBase64(null);
+    setGoalBase64(null);
+    if (!cur && !dst) return [];
+    if (!hasApiKey()) return [];
+    try {
+      const result = await calibrateFromPhotos(cur ?? undefined, dst ?? undefined);
+      const facts: string[] = [];
+      if (result.goal_direction) facts.push(`goal direction: ${result.goal_direction}`);
+      if (result.training_emphasis) facts.push(`training emphasis: ${result.training_emphasis}`);
+      if (result.motivation) facts.push(`motivation: ${result.motivation}`);
+      return facts;
+    } catch {
+      // Soft-skip: no facts seeded, no scary error to her face.
+      return [];
+    }
+  }
+
   const isLast = stepIndex === STEPS.length - 1;
+
+  // Photo step advance: if she added at least one photo we run the vision call
+  // (with a small loading state) and only THEN advance. Otherwise we just
+  // advance. Either way the base64 is dropped before we move on.
+  async function advanceFromPhotos() {
+    if (calibrating) return;
+    setCalibrating(true);
+    try {
+      const facts = await runCalibration();
+      setCalibratedFacts(facts);
+      setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+    } finally {
+      setCalibrating(false);
+    }
+  }
 
   function next() {
     if (isLast) {
       void finish();
+      return;
+    }
+    if (step === "photos") {
+      void advanceFromPhotos();
       return;
     }
     setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
@@ -342,9 +474,13 @@ export default function OnboardingScreen({
       // one. addMemory dedupes (case-insensitive, trimmed) and caps, so we can fold
       // chip facts AND any free-text notes without piling up duplicates. Free-text
       // notes are seeded verbatim — short user-written facts like "no shellfish".
+      // The photo-step calibrated facts (qualitative goal_direction /
+      // training_emphasis / motivation strings, NEVER numbers — enforced by
+      // CALIBRATION_SYSTEM + the tool schema in lib/coach.ts) ride this same path.
       const facts = [...chipFacts];
       const note = dietNotes.trim();
       if (note) facts.push(note);
+      for (const f of calibratedFacts) facts.push(f);
       for (const f of facts) profile = addMemory(profile, f);
 
       await initProfile(profile);
@@ -514,6 +650,100 @@ export default function OnboardingScreen({
                 </TouchableOpacity>
               ))}
             </View>
+          </View>
+        )}
+
+        {step === "photos" && (
+          <View>
+            <Text style={styles.title}>Your goals in pictures</Text>
+            <Text style={styles.subtitle}>
+              Optional: a photo of you now, and one that captures where you want to go — a workout,
+              a person, a vibe, a feeling. Your Coach uses it to understand the direction you're
+              going.
+            </Text>
+            {/* Load-bearing transparency line: macros stay computed from her stats
+                with a safety floor. This is the safety contract she sees on this
+                screen. Do not remove or soften. */}
+            <Text style={styles.body}>
+              Your macros stay computed from your stats with a safety floor; photos don't change the
+              numbers.
+            </Text>
+
+            <Text style={styles.label}>A photo of you now</Text>
+            {currentUri ? (
+              <View style={styles.photoSlotFilled}>
+                <Image source={{ uri: currentUri }} style={styles.photoThumb} />
+                <View style={styles.photoSlotActions}>
+                  <TouchableOpacity
+                    style={styles.photoSlotBtn}
+                    onPress={() => offerPickPhoto("current")}
+                    disabled={calibrating}
+                  >
+                    <Text style={styles.photoSlotBtnText}>Replace</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.photoSlotBtn}
+                    onPress={() => removePhoto("current")}
+                    disabled={calibrating}
+                  >
+                    <Text style={styles.photoSlotBtnText}>Remove</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.photoSlotEmpty}
+                onPress={() => offerPickPhoto("current")}
+                disabled={calibrating}
+              >
+                <Text style={styles.photoSlotEmptyText}>Tap to add a photo · optional</Text>
+              </TouchableOpacity>
+            )}
+
+            <Text style={styles.label}>A photo of where you want to go</Text>
+            {goalUri ? (
+              <View style={styles.photoSlotFilled}>
+                <Image source={{ uri: goalUri }} style={styles.photoThumb} />
+                <View style={styles.photoSlotActions}>
+                  <TouchableOpacity
+                    style={styles.photoSlotBtn}
+                    onPress={() => offerPickPhoto("goal")}
+                    disabled={calibrating}
+                  >
+                    <Text style={styles.photoSlotBtnText}>Replace</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.photoSlotBtn}
+                    onPress={() => removePhoto("goal")}
+                    disabled={calibrating}
+                  >
+                    <Text style={styles.photoSlotBtnText}>Remove</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.photoSlotEmpty}
+                onPress={() => offerPickPhoto("goal")}
+                disabled={calibrating}
+              >
+                <Text style={styles.photoSlotEmptyText}>
+                  Tap to add a photo · a workout, a person, a vibe — optional
+                </Text>
+              </TouchableOpacity>
+            )}
+
+            {calibrating && (
+              <View style={styles.calibratingRow}>
+                <ActivityIndicator color={ACCENT} />
+                <Text style={styles.calibratingText}>Reading what motivates you…</Text>
+              </View>
+            )}
+
+            <Text style={styles.hint}>
+              Photos aren't saved — your Coach reads them once to understand the direction, then
+              they're discarded. Skip the whole step anytime.
+            </Text>
           </View>
         )}
 
@@ -690,14 +920,14 @@ export default function OnboardingScreen({
       {/* Sticky footer nav: Back, optional Skip on skippable steps, and Next. */}
       <View style={styles.footer}>
         {stepIndex > 0 ? (
-          <TouchableOpacity style={styles.backBtn} onPress={back} disabled={saving}>
+          <TouchableOpacity style={styles.backBtn} onPress={back} disabled={saving || calibrating}>
             <Text style={styles.backBtnText}>Back</Text>
           </TouchableOpacity>
         ) : (
           <View style={styles.backBtnSpacer} />
         )}
 
-        <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving}>
+        <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving || calibrating}>
           <Text style={styles.nextBtnText}>
             {isLast
               ? saving
@@ -705,7 +935,11 @@ export default function OnboardingScreen({
                 : startDest === "workout"
                   ? "Build my plan"
                   : "Meet your Coach"
-              : "Next"}
+              : step === "photos" && calibrating
+                ? "Reading…"
+                : step === "photos" && !currentUri && !goalUri
+                  ? "Skip"
+                  : "Next"}
           </Text>
         </TouchableOpacity>
       </View>
@@ -796,6 +1030,49 @@ const styles = StyleSheet.create({
   calendarBtnText: { fontSize: 18 },
   doneBtn: { alignSelf: "flex-end", paddingVertical: 8, paddingHorizontal: 12 },
   doneBtnText: { color: ACCENT, fontWeight: "700", fontSize: 15 },
+  // Photo "calibration" step slots. The empty state is a dashed tap target; the
+  // filled state shows a thumbnail with Replace/Remove buttons. Slots are small
+  // (~100px tall) so both fit on screen without scroll being a fight.
+  photoSlotEmpty: {
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: "#cfc8e0",
+    borderRadius: 12,
+    paddingVertical: 22,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#faf9fd",
+  },
+  photoSlotEmptyText: { color: ACCENT, fontWeight: "600", fontSize: 14, textAlign: "center", paddingHorizontal: 12 },
+  photoSlotFilled: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    borderWidth: 1,
+    borderColor: "#e7e3f2",
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: "#faf9fd",
+  },
+  photoThumb: { width: 80, height: 80, borderRadius: 8, backgroundColor: "#eee" },
+  photoSlotActions: { flex: 1, gap: 8 },
+  photoSlotBtn: {
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    alignItems: "center",
+    backgroundColor: "#fff",
+  },
+  photoSlotBtnText: { color: "#333", fontSize: 14, fontWeight: "600" },
+  calibratingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 16,
+  },
+  calibratingText: { color: "#666", fontSize: 14 },
   // Final "how to start" choice cards.
   startCard: {
     borderWidth: 1,

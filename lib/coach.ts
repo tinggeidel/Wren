@@ -943,6 +943,149 @@ export async function estimateFoodFromPhoto(
   return items.filter((i) => i && i.name && typeof i.calories === "number");
 }
 
+// --- Onboarding photo "calibration" ---------------------------------------------
+// Optional onboarding step where she can share two photos (a current one and one
+// that captures where she wants to go / what motivates her). The vision model
+// returns QUALITATIVE TEXT ONLY — short strings the Coach + plan generator can
+// seed as durable memory facts. The photos themselves are USE-THEN-DISCARD: the
+// caller drops the base64 after this returns, so nothing is persisted to disk or
+// to the Profile. Crucially, this NEVER overrides `profile.goal` and NEVER feeds
+// numeric weight/BF/calorie estimates — the safety floor (BMR or 1200) and the
+// goal-pick-driven calorie multiplier are the SOLE source of macros. This call
+// is the highest ED-risk surface in the app, so the prompt + tool schema are
+// the guardrails (no numeric output is even shaped).
+//
+// Composition order matters: CALIBRATION SAFETY is stated first, then the shared
+// ED_SAFETY_RULES is appended VERBATIM as the FINAL block so the same
+// "overrides everything" line lands last, identical to every other LLM surface.
+
+export type CalibrationResult = {
+  goal_direction: string;
+  training_emphasis: string;
+  motivation: string;
+};
+
+const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce three short, QUALITATIVE notes the Coach can use to understand the direction she's going — not to assess her body.
+
+CALIBRATION SAFETY (overrides anything below it except the final SAFETY block):
+- Output is QUALITATIVE TEXT ONLY. The three fields are short strings: goal_direction, training_emphasis, motivation. Never include a body-fat percentage, a body-weight estimate or target, a goal weight, a calorie number, or any other number framed as a target. The tool schema does not accept numbers and you must not put numbers into the text fields either.
+- Do NOT assess the CURRENT photo to estimate her weight, body-fat, or measurements, and do not compare the two photos as "before/after." She picked her goal explicitly on a different screen — your output ENRICHES the Coach's understanding, it does NOT set targets.
+- training_emphasis is a qualitative training direction only (e.g. "strength + hypertrophy", "more conditioning, light lifting", "steady mobility + walking"). Never a calorie number, never a macro number, never a weekly volume number.
+- If the goal image reflects an extreme, unhealthy, or visibly thinspo-style ideal (very low body-fat / extreme leanness presented as the goal), do NOT endorse it. Gently steer the three fields toward a STRENGTH, HEALTH, FEEL-BASED framing instead (e.g. "feeling strong and energized" rather than "getting that lean"). The motivation field must NEVER cheerlead extreme leanness, weight loss, or shrinking the body as the goal.
+- Supportive and warm, never shaming, never comparison-as-judgment. Do not write anything like "you need to look like this" or "you should be smaller." Frame motivation around what she is moving TOWARD (strength, energy, confidence, capability, how she wants to feel).
+- Keep all three fields short — roughly one sentence each, plain text, no markdown.
+- If she shared only one photo, infer what you can from that one and leave the other side unweighted; don't make up what wasn't shown.
+
+Report by calling the report_calibration tool exactly once with the three fields.
+
+${ED_SAFETY_RULES}`;
+
+const CALIBRATION_TOOL = {
+  name: "report_calibration",
+  description:
+    "Report the three short qualitative notes about the direction she's going. Text only — never numbers, never weight or body-fat estimates, never calorie or macro targets.",
+  input_schema: {
+    type: "object",
+    properties: {
+      goal_direction: {
+        type: "string",
+        description:
+          "Short qualitative description of the direction she's going, e.g. 'leaner + stronger recomp', 'build visible muscle', 'general health and energy'. Never a body-fat % or weight number.",
+      },
+      training_emphasis: {
+        type: "string",
+        description:
+          "Short qualitative training emphasis, e.g. 'strength + hypertrophy', 'more conditioning, light lifting', 'steady mobility and walking'. Never a calorie number.",
+      },
+      motivation: {
+        type: "string",
+        description:
+          "Short supportive note in the Coach's voice the Coach can echo back, framed around strength/health/how she wants to feel. Never cheerlead extreme leanness or weight loss.",
+      },
+    },
+    required: ["goal_direction", "training_emphasis", "motivation"],
+  },
+};
+
+// Run the calibration call. At least one of currentBase64 / goalBase64 should be
+// provided — the caller (onboarding) only invokes this when she shared a photo.
+// On any failure (network, API, parse, empty result) we throw so the caller can
+// soft-skip; onboarding must always complete even if this call fails.
+export async function calibrateFromPhotos(
+  currentBase64?: string,
+  goalBase64?: string
+): Promise<CalibrationResult> {
+  if (!hasApiKey()) throw new Error("Coach isn't connected — add your API key in .env.");
+  if (!currentBase64 && !goalBase64) throw new Error("No photo provided.");
+
+  // Build a single user message whose content interleaves the photos with a small
+  // label so the model knows which is which, followed by the instruction text.
+  const content: ContentBlock[] = [];
+  if (currentBase64) {
+    content.push({ type: "text", text: "Photo 1 — her now:" });
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: currentBase64 },
+    });
+  }
+  if (goalBase64) {
+    content.push({
+      type: "text",
+      text: "Photo 2 — the direction she's drawn to (a workout, a person, a vibe, a feeling):",
+    });
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: goalBase64 },
+    });
+  }
+  content.push({
+    type: "text",
+    text: "Produce the three short qualitative notes by calling report_calibration. Text only — no numbers, no weight/BF estimates, no calorie targets. If the goal image leans toward an extreme or unhealthy ideal, steer toward a strength/health/feel-based framing.",
+  });
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": API_KEY as string,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: SONNET,
+      max_tokens: 512,
+      system: CALIBRATION_SYSTEM,
+      tools: [CALIBRATION_TOOL],
+      tool_choice: { type: "tool", name: "report_calibration" },
+      messages: [{ role: "user", content }],
+    }),
+  });
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const err = await res.json();
+      detail = err?.error?.message ?? JSON.stringify(err);
+    } catch {
+      detail = await res.text();
+    }
+    throw new Error(`Claude API ${res.status}: ${detail}`);
+  }
+
+  const data = (await res.json()) as { content?: ContentBlock[] };
+  const block = (data.content ?? []).find(
+    (b): b is { type: "tool_use"; id: string; name: string; input: unknown } => b.type === "tool_use"
+  );
+  const raw = (block?.input ?? {}) as Partial<CalibrationResult>;
+  const goal_direction = (raw.goal_direction ?? "").toString().trim();
+  const training_emphasis = (raw.training_emphasis ?? "").toString().trim();
+  const motivation = (raw.motivation ?? "").toString().trim();
+  if (!goal_direction && !training_emphasis && !motivation) {
+    throw new Error("No calibration produced.");
+  }
+  return { goal_direction, training_emphasis, motivation };
+}
+
 // --- Feature E: tailored weekly plan generation --------------------------------
 
 const PLAN_SYSTEM = `You are the Flux coach building one week of training for a woman who trains with her cycle. You are an expert, honest coach — warm but never a yes-man.
