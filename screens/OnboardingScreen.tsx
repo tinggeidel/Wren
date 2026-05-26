@@ -292,11 +292,10 @@ export default function OnboardingScreen({
   // seeded as durable memory via calibratedFacts at finish() time.
   const [calibrationResult, setCalibrationResult] = useState<CalibrationResult | null>(null);
   // Confirmation overlay flag: when true the photo step swaps to a small card
-  // showing the three qualitative strings, with auto-advance after a short
-  // delay or a manual Continue tap. Auto-advance timer is held in a ref so we
-  // can clear it on unmount or manual continue (no leak, no double-advance).
+  // showing the three qualitative strings. The card stays up until the user
+  // taps Continue — no auto-advance — so she has as long as she needs to read
+  // what her photos produced.
   const [showCalibrationConfirm, setShowCalibrationConfirm] = useState(false);
-  const calibrationAdvanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -460,41 +459,20 @@ export default function OnboardingScreen({
 
   const isLast = stepIndex === STEPS.length - 1;
 
-  // Auto-advance delay for the photo-calibration confirmation card. Long enough
-  // that she can actually READ the three qualitative strings; short enough that
-  // it doesn't feel stuck. A manual "Continue" tap on the card advances
-  // immediately and cancels the timer.
-  const CALIBRATION_CONFIRM_AUTOADVANCE_MS = 2200;
-
-  // Clear the auto-advance timer on unmount so we never call setState after the
-  // screen is gone (and never leak the handle).
-  useEffect(() => {
-    return () => {
-      if (calibrationAdvanceTimer.current != null) {
-        clearTimeout(calibrationAdvanceTimer.current);
-        calibrationAdvanceTimer.current = null;
-      }
-    };
-  }, []);
-
-  // Cancel any pending auto-advance and move to the next step. Idempotent —
-  // safe whether the timer is pending, already fired, or never started.
+  // Move to the next step from the calibration confirmation card. The card
+  // stays up until she taps Continue — no auto-advance — so she has as long
+  // as she needs to read what her photos produced.
   function commitCalibrationAndAdvance() {
-    if (calibrationAdvanceTimer.current != null) {
-      clearTimeout(calibrationAdvanceTimer.current);
-      calibrationAdvanceTimer.current = null;
-    }
     setShowCalibrationConfirm(false);
     setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
   }
 
   // Photo step advance: if she added at least one photo we run the vision call
-  // (with a small loading state). On a non-empty result we briefly SHOW her the
-  // captured direction in a confirmation card (so she sees the photos
-  // actually produced something) and auto-advance after a short delay; she can
-  // also tap "Continue" to advance immediately. On empty result or skip, we
-  // silently advance as before. Either way the base64 is dropped before we
-  // move on (handled inside runCalibration).
+  // (with a small loading state). On a non-empty result we SHOW her the
+  // captured direction in a confirmation card (so she sees the photos actually
+  // produced something); the card stays up until she taps Continue. On empty
+  // result or skip, we silently advance as before. Either way the base64 is
+  // dropped before we move on (handled inside runCalibration).
   async function advanceFromPhotos() {
     if (calibrating) return;
     setCalibrating(true);
@@ -503,13 +481,8 @@ export default function OnboardingScreen({
       setCalibratedFacts(facts);
       setCalibrationResult(result);
       if (result && facts.length > 0) {
-        // Show the confirmation card; arm the auto-advance.
+        // Show the confirmation card; she advances when ready by tapping Continue.
         setShowCalibrationConfirm(true);
-        calibrationAdvanceTimer.current = setTimeout(() => {
-          calibrationAdvanceTimer.current = null;
-          setShowCalibrationConfirm(false);
-          setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
-        }, CALIBRATION_CONFIRM_AUTOADVANCE_MS);
       } else {
         // Soft-skip path: no card, just keep moving.
         setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
@@ -789,19 +762,19 @@ export default function OnboardingScreen({
         )}
 
         {step === "photos" && showCalibrationConfirm && calibrationResult && (
-          // Brief post-call confirmation: she sees that her photos actually
+          // Post-call confirmation: she sees that her photos actually
           // produced something before we advance. Only the three QUALITATIVE
           // strings render here — no numbers, no body assessment, no
           // before/after framing (the CALIBRATION_SYSTEM prompt enforces those
           // constraints at the model layer; this UI just displays the result).
-          // Auto-advances after CALIBRATION_CONFIRM_AUTOADVANCE_MS, or
-          // immediately on Continue. Use-then-discard for the base64 already
-          // happened in runCalibration.
+          // The card stays up until she taps Continue — no auto-advance — so
+          // she can read it at her own pace. Use-then-discard for the base64
+          // already happened in runCalibration.
           <View>
             <Text style={styles.title}>Got it</Text>
             <Text style={styles.subtitle}>
-              Saved to your Coach's memory. You can adjust anytime in Settings under "What your
-              Coach remembers about you."
+              Here's what your Coach took from those — saved to memory and editable any time in
+              Settings. Take a look, then tap Continue when you're ready.
             </Text>
 
             <View style={styles.confirmCard}>
@@ -1097,8 +1070,8 @@ export default function OnboardingScreen({
 
       {/* Sticky footer nav: Back, optional Skip on skippable steps, and Next.
           While the calibration confirmation card is up, footer controls hide so
-          the user's only forward path is the on-card Continue button (or the
-          auto-advance timer) — keeps her eyes on the result that just landed. */}
+          the user's only forward path is the on-card Continue button — keeps
+          her eyes on the result that just landed. */}
       {!(step === "photos" && showCalibrationConfirm) && (
         <View style={styles.footer}>
           {stepIndex > 0 ? (
