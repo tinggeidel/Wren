@@ -12,8 +12,10 @@ import {
   Alert,
   Image,
   Modal,
+  Keyboard,
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { toJpegBase64 } from "../lib/image";
 import {
   Profile,
@@ -94,6 +96,13 @@ export default function CoachScreen({
   const [booting, setBooting] = useState(true);
   const [scanning, setScanning] = useState(false);
   const scrollRef = useRef<ScrollView>(null);
+  // The Coach screen lives inside App's SafeAreaView (edges top+bottom), which
+  // already reserves the top inset ABOVE this KeyboardAvoidingView. With
+  // behavior="padding", iOS measures the view's screen position to size the
+  // padding, so we offset by the top inset to keep the input row exactly above
+  // the keyboard. The custom tab bar sits BELOW our SafeAreaView, so it doesn't
+  // add to this offset.
+  const insets = useSafeAreaInsets();
 
   // Always-current view of `messages`, so append-and-persist paths can build on
   // the latest list (not a stale render closure) before calling saveChat. Mirrors
@@ -110,6 +119,18 @@ export default function CoachScreen({
   useEffect(() => {
     profileRef.current = profile;
   }, [profile]);
+
+  // When the keyboard opens, keep the latest message in view. onContentSizeChange
+  // doesn't fire on keyboard show (the content height is unchanged), so the list
+  // would otherwise stay scrolled where it was and the newest bubble can hide
+  // behind the input row. iOS uses keyboardWillShow for a smooth, in-sync scroll.
+  useEffect(() => {
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const sub = Keyboard.addListener(showEvent, () => {
+      scrollRef.current?.scrollToEnd({ animated: true });
+    });
+    return () => sub.remove();
+  }, []);
 
   // Lets the Coach write food/water she's told about into the structured store.
   // Each call mutates the working profile, persists it, and reports the new
@@ -330,6 +351,9 @@ export default function CoachScreen({
     if (name === "remember_fact") {
       const a = input as RememberFactArgs;
       const fact = (a.fact ?? "").trim();
+      // Lightweight trace so Ting can confirm in Metro logs whether the model
+      // actually fires this tool (vs. just saying "I'll remember" in prose).
+      console.log("[Coach] remember_fact called:", JSON.stringify(a));
       if (!fact) return "Nothing to remember — no fact given.";
       const updated = addMemory(profileRef.current, fact);
       // addMemory is a no-op on a duplicate, so detect that to report honestly.
@@ -341,6 +365,7 @@ export default function CoachScreen({
     }
     if (name === "forget_fact") {
       const a = input as ForgetFactArgs;
+      console.log("[Coach] forget_fact called:", JSON.stringify(a));
       const q = (a.fact ?? "").trim().toLowerCase();
       if (!q) return "Nothing to forget — no fact given.";
       // Safe match: (1) prefer an exact (case-insensitive) hit; else (2) stored
@@ -597,6 +622,7 @@ export default function CoachScreen({
     <KeyboardAvoidingView
       style={styles.flex}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
+      keyboardVerticalOffset={Platform.OS === "ios" ? insets.top : 0}
     >
       <View style={styles.header}>
         <View>

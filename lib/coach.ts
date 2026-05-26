@@ -89,9 +89,10 @@ WORKOUTS:
 
 LONG-TERM MEMORY:
 - You have a small, durable memory of facts about her, shown in the context under "WHAT YOU REMEMBER ABOUT HER". It is separate from this conversation and always applies — use it to stay consistent and personal across days.
-- Use the remember_fact tool to save a lasting, useful fact she tells you: dietary restrictions or preferences, foods she likes or dislikes, injuries or physical limitations, equipment or training access, schedule constraints, life events, her goals and her "why," and what motivates her. Keep each fact short and factual, in your words (e.g. "no dairy", "bad left knee, avoid deep lunges", "trains at home with dumbbells and bands", "training for a wedding in October").
+- CRITICAL — how memory actually works: the ONLY way to save something is to call the remember_fact tool. Saying "I'll remember that" or "noted" in your reply does NOTHING — if you don't call the tool, the fact is lost the moment this conversation scrolls past. So whenever she tells you a lasting fact about herself, you MUST call remember_fact in that same turn. Do not promise to remember without calling the tool; do not assume it's already saved.
+- Save a lasting, useful fact she tells you: dietary restrictions or preferences, foods she likes or dislikes, injuries or physical limitations, equipment or training access, schedule constraints, life events, her goals and her "why," and what motivates her. Keep each fact short and factual, in your words (e.g. "no dairy", "bad left knee, avoid deep lunges", "trains at home with dumbbells and bands", "training for a wedding in October"). When in doubt about whether something durable is worth keeping, save it — it's cheap, capped, and she can delete it in Settings.
 - Do NOT save transient daily data — today's food, mood, energy, or workout are already tracked elsewhere — and do not save trivia or anything that won't matter next week.
-- Use the forget_fact tool when something changes or was wrong, so you can self-correct (e.g. she healed an injury, or stopped a restriction).
+- Use the forget_fact tool when something changes or was wrong, so you can self-correct (e.g. she healed an injury, or stopped a restriction). Same rule: only the tool changes anything; saying "I'll forget that" without calling forget_fact does nothing.
 - ED-SAFETY (critical): never store a specific goal weight or a calorie number as a target to pursue, and never store restrictive or compensatory intentions, or body-shaming self-talk, as facts to act on. The SAFETY rules below still govern everything; memory must never be used to encode, remember toward, or optimize for an unsafe goal.
 
 ${ED_SAFETY_RULES}`;
@@ -233,10 +234,21 @@ function buildContextBlock(profile: Profile): string {
 
 // Route simple messages to Haiku; escalate plans/macros/food/coaching to Sonnet
 // (Sonnet gives better macro estimates when logging food she describes).
+//
+// We also escalate likely DURABLE-FACT disclosures (memory triggers) to Sonnet:
+// Haiku is markedly less reliable at *proactively* deciding to fire remember_fact
+// when nothing forces it, so a user saying "I'm vegetarian" on Haiku often gets a
+// prose "I'll remember that" with no tool call and nothing persists. Sonnet
+// reliably calls the tool. These phrases are intentionally broad but cheap — they
+// only fire on first-person disclosures, not every message.
+const MEMORY_TRIGGERS =
+  /\bremember\b|\bforget\b|\bvegetarian\b|\bvegan\b|\bpescatarian\b|\bgluten\b|\bdairy\b|\blactose\b|\ballerg|\bintoleran|i (can'?t|cannot|don'?t|do not|won'?t) (eat|have|do)|\binjur|\bsurgery\b|\bknee\b|\bshoulder\b|\bback (pain|injury|issue)|\bi prefer\b|\bi like\b|\bi love\b|\bi hate\b|\bi don'?t like\b|\bi'?m training for\b|\btraining for (a|my)\b|\bwedding\b|\bi work\b|\bnight shift\b|\bi only have\b|\bi train at\b|\bat home\b|\bi have (a|an)\b/;
+
 function pickModel(text: string): string {
   const t = text.toLowerCase();
   const complex =
     text.length > 200 ||
+    MEMORY_TRIGGERS.test(t) ||
     /\bwhy\b|\bplan\b|macro|calorie|protein|target|feel|stress|anxious|\bsad\b|depress|tired|exhaust|advice|should i\b|explain|struggl|\bate\b|\beat\b|\bhad\b|breakfast|lunch|dinner|snack|drank|\bwater\b|\blog\b/.test(
       t
     );
