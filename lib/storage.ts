@@ -38,7 +38,17 @@ export async function loadProfile(): Promise<Profile | null> {
 }
 
 export async function saveProfile(p: Profile): Promise<void> {
-  await AsyncStorage.setItem(PROFILE_KEY, JSON.stringify(p));
+  // A failed disk write must not reject: many callers fire updateProfile/persist
+  // without awaiting (e.g. tapping +water, checking off an exercise), so an
+  // AsyncStorage rejection here would surface as an unhandled promise rejection
+  // and could crash. We swallow it so the in-memory profile (already updated
+  // synchronously in App.updateProfile before this await) stays usable for the
+  // session; only the persist-to-disk failed. console.warn is the minimum signal.
+  try {
+    await AsyncStorage.setItem(PROFILE_KEY, JSON.stringify(p));
+  } catch (e) {
+    console.warn("Flux: failed to save profile to storage", e);
+  }
 }
 
 // The chat persists across days now. `lastDate` lets us detect a new day so the
@@ -96,9 +106,21 @@ export async function saveChat(
     summary: cont.summary,
     summarizedCount: cont.summarizedCount,
   };
-  await AsyncStorage.setItem(CHAT_KEY, JSON.stringify(payload));
+  // Same rationale as saveProfile: don't reject on a failed write. saveChat is
+  // awaited inside CoachScreen try/catch blocks, but some of those wrap user-
+  // facing flows (kickoff, summarize) that would otherwise have no signal — a
+  // warn keeps the live chat working while flagging that persistence failed.
+  try {
+    await AsyncStorage.setItem(CHAT_KEY, JSON.stringify(payload));
+  } catch (e) {
+    console.warn("Flux: failed to save chat to storage", e);
+  }
 }
 
 export async function clearChat(): Promise<void> {
-  await AsyncStorage.removeItem(CHAT_KEY);
+  try {
+    await AsyncStorage.removeItem(CHAT_KEY);
+  } catch (e) {
+    console.warn("Flux: failed to clear chat from storage", e);
+  }
 }

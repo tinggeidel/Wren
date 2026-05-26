@@ -542,6 +542,11 @@ export default function CoachScreen({
           setSending(false);
         }
       }
+    }).catch(() => {
+      // loadChat already swallows parse errors, but a storage read rejection must
+      // never leave the Coach stuck on its boot spinner — clear booting so she can
+      // still type even if history couldn't load.
+      if (active) setBooting(false);
     });
     return () => {
       active = false;
