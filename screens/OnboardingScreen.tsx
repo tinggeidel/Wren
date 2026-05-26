@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -8,8 +8,6 @@ import {
   ScrollView,
   StyleSheet,
   Platform,
-  NativeSyntheticEvent,
-  NativeScrollEvent,
 } from "react-native";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import {
@@ -76,90 +74,104 @@ function minBirthDate(): Date {
   return d;
 }
 
-// --- Scroll-wheel picker (core RN only, no native dep) ---------------------
-// A vertical snap list: items are ITEM_H tall, with ITEM_H padding top+bottom so
-// the first/last value can center. The centered item (scroll offset / ITEM_H) is
-// the selection. onChange fires only on a real settle (momentum or drag end), so
-// programmatic/initial layout doesn't count as a user choice — the parent decides
-// "touched" from that.
-const ITEM_H = 40;
-// 3 visible rows (was 5) keeps the wheel short (120px) so the whole Body step —
-// DOB + height + weight + Activity Level — fits one phone screen without the
-// outer page needing to scroll. That removes the wheel-vs-page vertical gesture
-// conflict that made Activity Level unreachable. Still odd, so there's a clear
-// centered middle row for the selection band.
-const VISIBLE = 3;
-const WHEEL_H = ITEM_H * VISIBLE;
+// --- Stepper (core RN only, no native dep) ---------------------------------
+// A -/+ row with a centered value. Replaces the old scroll-wheels, which froze
+// the Body step (the weight wheel rendered ~270 non-virtualized rows nested in
+// the page) and fought the page's vertical scroll. No nested scroll views, so
+// the freeze and gesture conflict are gone.
+//
+// Tap = step once; press-and-hold = repeat. onPressIn does one immediate step,
+// then starts a setInterval that keeps stepping while held; onPressOut/onBlur
+// (and unmount, via the effect) clear the interval so no timer leaks. Buttons
+// disable + stop at min/max, and every step is clamped to [min, max] as a belt-
+// and-braces guard. onChange fires only from a real press, so the parent's
+// "touched" flag is never tripped by mount/layout — a skipped step stays blank.
+const HOLD_REPEAT_MS = 100;
 
-function WheelPicker({
-  values,
-  selectedIndex,
-  onChange,
-  labelFor,
-  width,
+function StepButton({
+  label,
+  disabled,
+  onStep,
 }: {
-  values: number[];
-  selectedIndex: number;
-  onChange: (index: number) => void;
-  labelFor: (v: number) => string;
-  width?: number;
+  label: string;
+  disabled: boolean;
+  onStep: () => void;
 }) {
-  const ref = useRef<ScrollView>(null);
-  // Initial scroll position so the selected value starts centered. We set it via
-  // contentOffset on mount; later programmatic corrections aren't needed because
-  // the parent drives selectedIndex and we only call onChange on settle.
-  const clamp = (i: number) => Math.max(0, Math.min(values.length - 1, i));
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  function settle(e: NativeSyntheticEvent<NativeScrollEvent>) {
-    const idx = clamp(Math.round(e.nativeEvent.contentOffset.y / ITEM_H));
-    if (idx !== selectedIndex) onChange(idx);
-    // Re-snap exactly in case the OS left us a hair off the grid.
-    ref.current?.scrollTo({ y: idx * ITEM_H, animated: true });
+  function clear() {
+    if (timer.current != null) {
+      clearInterval(timer.current);
+      timer.current = null;
+    }
   }
 
+  function start() {
+    if (disabled) return;
+    onStep(); // immediate first step on press
+    clear(); // never stack intervals
+    timer.current = setInterval(onStep, HOLD_REPEAT_MS);
+  }
+
+  // Clear any running interval if the button unmounts mid-hold (e.g. the user
+  // navigates away while holding) so we never leak a timer.
+  useEffect(() => clear, []);
+
   return (
-    <View style={[styles.wheel, width != null && { width }]}>
-      {/* Center selection band, drawn behind the items. */}
-      <View pointerEvents="none" style={styles.wheelBand} />
-      <ScrollView
-        ref={ref}
-        // nestedScrollEnabled lets Android hand the gesture back to the parent
-        // page ScrollView when this short wheel reaches its scroll bounds. On iOS
-        // it's a no-op, but with VISIBLE=3 the page shouldn't need to scroll at
-        // all on a typical phone, so this is purely a small-screen safety net.
-        nestedScrollEnabled
-        showsVerticalScrollIndicator={false}
-        snapToInterval={ITEM_H}
-        decelerationRate="fast"
-        contentOffset={{ x: 0, y: selectedIndex * ITEM_H }}
-        onMomentumScrollEnd={settle}
-        onScrollEndDrag={settle}
-        contentContainerStyle={{ paddingVertical: (WHEEL_H - ITEM_H) / 2 }}
-      >
-        {values.map((v, i) => (
-          <View key={v} style={styles.wheelItem}>
-            <Text style={[styles.wheelText, i === selectedIndex && styles.wheelTextOn]}>
-              {labelFor(v)}
-            </Text>
-          </View>
-        ))}
-      </ScrollView>
+    <TouchableOpacity
+      style={[styles.stepBtn, disabled && styles.stepBtnDisabled]}
+      onPressIn={start}
+      onPressOut={clear}
+      // onBlur isn't a TouchableOpacity event; clear() in the effect cleanup and
+      // onPressOut cover the leak cases. Keeping accessibility props explicit.
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={label === "−" ? "Decrease" : "Increase"}
+    >
+      <Text style={[styles.stepBtnText, disabled && styles.stepBtnTextDisabled]}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function Stepper({
+  value,
+  min,
+  max,
+  display,
+  onChange,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  display: string;
+  onChange: (next: number) => void;
+}) {
+  const clamp = (n: number) => Math.max(min, Math.min(max, n));
+  return (
+    <View style={styles.stepperRow}>
+      <StepButton label="−" disabled={value <= min} onStep={() => onChange(clamp(value - 1))} />
+      <View style={styles.stepperValueBox}>
+        <Text style={styles.stepperValue}>{display}</Text>
+      </View>
+      <StepButton label="+" disabled={value >= max} onStep={() => onChange(clamp(value + 1))} />
     </View>
   );
 }
 
-// Inclusive integer range helper for wheel value lists.
-function range(lo: number, hi: number): number[] {
-  const out: number[] = [];
-  for (let n = lo; n <= hi; n++) out.push(n);
-  return out;
-}
+// Stepper bounds. Height is in TOTAL INCHES (54 = 4'6", 84 = 7'0"); weight in lb.
+const HEIGHT_MIN_IN = 54;
+const HEIGHT_MAX_IN = 84;
+const HEIGHT_DEFAULT_IN = 66; // 5'6"
+const WEIGHT_MIN_LB = 80;
+const WEIGHT_MAX_LB = 350;
+const WEIGHT_DEFAULT_LB = 150;
 
-// Height wheel options (US ft/in). Sensible human bounds.
-const FEET = range(4, 7);
-const INCHES = range(0, 11);
-// Weight wheel options (lb). Reasonable adult range.
-const WEIGHTS = range(80, 350);
+// Format total inches as the ft'in" string parseHeightCm accepts (e.g. 5'6").
+function formatHeight(totalIn: number): string {
+  const ft = Math.floor(totalIn / 12);
+  const inch = totalIn % 12;
+  return `${ft}'${inch}"`;
+}
 
 // The lean step list. Body stats, cycle, and diet are all skippable — the app and
 // Coach already tolerate missing fields, and the Coach can ask for stats later.
@@ -211,16 +223,14 @@ export default function OnboardingScreen({
   const [birthDate, setBirthDate] = useState<Date>(defaultBirthDate);
   const [showBirthPicker, setShowBirthPicker] = useState(false);
 
-  // Body wheels: indices into the option lists. Defaults point at sensible middle
-  // values (5'6", 150 lb) for a friendly starting position, but they only get
-  // written into height/weight once she actually touches a wheel — tracked here.
-  const [feetIdx, setFeetIdx] = useState(() => FEET.indexOf(5));
-  const [inchIdx, setInchIdx] = useState(() => INCHES.indexOf(6));
+  // Body steppers: live numeric values. Defaults show a friendly starting point
+  // (5'6", 150 lb), but they only get written into height/weight once she
+  // actually presses a stepper — tracked by the *Touched flags. A skipped Body
+  // step (or an untouched stepper) leaves height/weight blank, so computeBMR
+  // returns null and the Coach asks later — never a silent default into BMR.
+  const [heightIn, setHeightIn] = useState(HEIGHT_DEFAULT_IN);
   const [heightTouched, setHeightTouched] = useState(false);
-  const [weightIdx, setWeightIdx] = useState(() => {
-    const i = WEIGHTS.indexOf(150);
-    return i >= 0 ? i : 0;
-  });
+  const [weightLb, setWeightLb] = useState(WEIGHT_DEFAULT_LB);
   const [weightTouched, setWeightTouched] = useState(false);
 
   function openPicker() {
@@ -254,23 +264,19 @@ export default function OnboardingScreen({
     setDietChips((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   }
 
-  // Wheel change handlers also fold the new selection into the height/weight
-  // strings in the SAME formats the existing parsers consume (parseHeightCm:
-  // 5'6"; parseWeightKg: 150 lb). Marking touched lets a skipped step stay blank.
-  function onFeet(i: number) {
-    setFeetIdx(i);
+  // Stepper change handlers fold the new value into the height/weight strings in
+  // the SAME formats the existing parsers consume (parseHeightCm: 5'6";
+  // parseWeightKg: 150 lb). Setting *Touched on first press is what lets a
+  // skipped/untouched step stay blank (no silent BMR default).
+  function onHeightChange(next: number) {
+    setHeightIn(next);
     setHeightTouched(true);
-    setHeight(`${FEET[i]}'${INCHES[inchIdx]}"`);
+    setHeight(formatHeight(next));
   }
-  function onInch(i: number) {
-    setInchIdx(i);
-    setHeightTouched(true);
-    setHeight(`${FEET[feetIdx]}'${INCHES[i]}"`);
-  }
-  function onWeight(i: number) {
-    setWeightIdx(i);
+  function onWeightChange(next: number) {
+    setWeightLb(next);
     setWeightTouched(true);
-    setWeight(`${WEIGHTS[i]} lb`);
+    setWeight(`${next} lb`);
   }
 
   const isLast = stepIndex === STEPS.length - 1;
@@ -467,44 +473,31 @@ export default function OnboardingScreen({
               </View>
             )}
 
-            {/* Height (ft + in) and Weight share one short wheel row so the whole
-                step fits the viewport. Three narrow wheels side by side leave wide
-                non-wheel strips (the gaps + labels) the user can grab to scroll the
-                page on small screens, instead of dragging over a wheel. */}
-            <View style={styles.wheelLabelRow}>
-              <Text style={[styles.label, styles.wheelLabelHeight]}>Height</Text>
-              <Text style={[styles.label, styles.wheelLabelWeight]}>Weight</Text>
-            </View>
-            <View style={styles.wheelRow}>
-              <View style={styles.wheelGroup}>
-                <WheelPicker
-                  values={FEET}
-                  selectedIndex={feetIdx}
-                  onChange={onFeet}
-                  labelFor={(v) => `${v} ft`}
-                />
-              </View>
-              <View style={styles.wheelGroup}>
-                <WheelPicker
-                  values={INCHES}
-                  selectedIndex={inchIdx}
-                  onChange={onInch}
-                  labelFor={(v) => `${v} in`}
-                />
-              </View>
-              <View style={styles.wheelGroup}>
-                <WheelPicker
-                  values={WEIGHTS}
-                  selectedIndex={weightIdx}
-                  onChange={onWeight}
-                  labelFor={(v) => `${v} lb`}
-                />
-              </View>
-            </View>
+            {/* Height and weight steppers. Tap −/+ to step, or press and hold to
+                repeat. No nested scroll views, so the step fits and scrolls
+                cleanly. The displayed default (5'6" / 150 lb) is only stored once
+                a stepper is actually touched. */}
+            <Text style={styles.label}>Height</Text>
+            <Stepper
+              value={heightIn}
+              min={HEIGHT_MIN_IN}
+              max={HEIGHT_MAX_IN}
+              display={formatHeight(heightIn)}
+              onChange={onHeightChange}
+            />
+
+            <Text style={styles.label}>Weight</Text>
+            <Stepper
+              value={weightLb}
+              min={WEIGHT_MIN_LB}
+              max={WEIGHT_MAX_LB}
+              display={`${weightLb} lb`}
+              onChange={onWeightChange}
+            />
             <Text style={styles.hint}>
-              {heightTouched ? `Height ${FEET[feetIdx]}'${INCHES[inchIdx]}".` : "Scroll to set height"}
+              {heightTouched ? `Height ${formatHeight(heightIn)}.` : "Tap or hold −/+ to set height"}
               {"  ·  "}
-              {weightTouched ? `Weight ${WEIGHTS[weightIdx]} lb.` : "scroll to set weight — or skip both."}
+              {weightTouched ? `Weight ${weightLb} lb.` : "set weight — or skip both."}
             </Text>
 
             <Text style={styles.label}>Activity level</Text>
@@ -758,36 +751,32 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 14, color: "#333" },
   chipTextActive: { color: "#fff", fontWeight: "600" },
   hint: { fontSize: 13, color: "#666", marginTop: 10, lineHeight: 18 },
-  // Scroll-wheel pickers (height ft/in, weight lb) — three side by side.
-  wheelRow: { flexDirection: "row", gap: 10, marginTop: 2 },
-  wheelGroup: { flex: 1 },
-  // Header row that labels the two wheel groups (Height spans ft+in, Weight one).
-  wheelLabelRow: { flexDirection: "row", marginTop: 16 },
-  wheelLabelHeight: { flex: 2, marginTop: 0, marginBottom: 0 },
-  wheelLabelWeight: { flex: 1, marginTop: 0, marginBottom: 0 },
-  wheel: {
-    height: WHEEL_H,
+  // Height/weight steppers: big −/+ buttons flanking a centered value.
+  stepperRow: { flexDirection: "row", alignItems: "stretch", gap: 10, marginTop: 2 },
+  stepBtn: {
+    width: 64,
+    height: 56,
     borderWidth: 1,
     borderColor: "#ddd",
     borderRadius: 10,
-    overflow: "hidden",
-    backgroundColor: "#fafafa",
+    backgroundColor: "#f0eef7",
+    alignItems: "center",
     justifyContent: "center",
   },
-  wheelBand: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    top: (WHEEL_H - ITEM_H) / 2,
-    height: ITEM_H,
-    backgroundColor: "#f0eef7",
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: "#e0d8f5",
+  stepBtnDisabled: { backgroundColor: "#f7f7f7", borderColor: "#eee" },
+  stepBtnText: { fontSize: 28, fontWeight: "700", color: ACCENT, lineHeight: 32 },
+  stepBtnTextDisabled: { color: "#ccc" },
+  stepperValueBox: {
+    flex: 1,
+    height: 56,
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 10,
+    backgroundColor: "#fafafa",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  wheelItem: { height: ITEM_H, alignItems: "center", justifyContent: "center" },
-  wheelText: { fontSize: 17, color: "#aaa" },
-  wheelTextOn: { color: "#1a1a1a", fontWeight: "700", fontSize: 18 },
+  stepperValue: { fontSize: 22, fontWeight: "700", color: "#1a1a1a" },
   switchRow: {
     flexDirection: "row",
     alignItems: "center",
