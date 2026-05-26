@@ -8,6 +8,7 @@ import {
   ScrollView,
   StyleSheet,
   Platform,
+  Alert,
 } from "react-native";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import {
@@ -41,6 +42,7 @@ export default function SettingsScreen({
   initial,
   updateProfile,
   onSaved,
+  onReset,
 }: {
   initial: Profile | null;
   // Single shared updater (App.tsx). Applies the form overlay to the LATEST
@@ -51,6 +53,9 @@ export default function SettingsScreen({
   // Navigation-only side effect after a full Save (jump to the Coach tab).
   // Per-row memory deletes deliberately do NOT call this, so they stay put.
   onSaved: () => void;
+  // "Start over": wipe all data and return to onboarding (App.resetApp). Only
+  // called after the destructive confirm in handleStartOver below.
+  onReset: () => Promise<void>;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [goal, setGoal] = useState<Goal>(initial?.goal ?? "feel_better");
@@ -139,6 +144,20 @@ export default function SettingsScreen({
   // and the list refreshes in place.
   async function handleForget(id: string) {
     await updateProfile((p) => removeMemory(p, id));
+  }
+
+  // "Start over": destructive, irreversible wipe. Gate it behind a confirm so a
+  // stray tap can't erase everything. Only the destructive button calls onReset,
+  // which clears all data and returns the app to onboarding.
+  function handleStartOver() {
+    Alert.alert(
+      "Start over?",
+      "This erases all your data — profile, logs, chat, plan, everything — and restarts onboarding. This can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Erase & restart", style: "destructive", onPress: () => void onReset() },
+      ]
+    );
   }
 
   return (
@@ -355,6 +374,17 @@ export default function SettingsScreen({
       <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
         <Text style={styles.saveBtnText}>Save & go to Coach</Text>
       </TouchableOpacity>
+
+      {/* Destructive zone — visually separated from the normal settings above so
+          it can't be mistaken for a routine action. Used to re-test onboarding. */}
+      <View style={styles.dangerZone}>
+        <TouchableOpacity style={styles.resetBtn} onPress={handleStartOver}>
+          <Text style={styles.resetBtnText}>Start over</Text>
+        </TouchableOpacity>
+        <Text style={styles.resetHint}>
+          Erases everything on this device and restarts onboarding.
+        </Text>
+      </View>
     </ScrollView>
   );
 }
@@ -450,4 +480,19 @@ const styles = StyleSheet.create({
     marginTop: 28,
   },
   saveBtnText: { color: "#fff", fontSize: 16, fontWeight: "700" },
+  dangerZone: {
+    marginTop: 40,
+    paddingTop: 24,
+    borderTopWidth: 1,
+    borderTopColor: "#eee",
+  },
+  resetBtn: {
+    borderWidth: 1,
+    borderColor: "#dc2626",
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+  resetBtnText: { color: "#dc2626", fontSize: 16, fontWeight: "700" },
+  resetHint: { fontSize: 13, color: "#999", marginTop: 10, textAlign: "center" },
 });

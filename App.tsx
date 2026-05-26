@@ -3,7 +3,7 @@ import { View, Text, TouchableOpacity, ActivityIndicator, StyleSheet } from "rea
 import { StatusBar } from "expo-status-bar";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { Profile } from "./lib/types";
-import { loadProfile, saveProfile } from "./lib/storage";
+import { loadProfile, saveProfile, clearAllData } from "./lib/storage";
 import CoachScreen from "./screens/CoachScreen";
 import FoodScreen from "./screens/FoodScreen";
 import CycleScreen from "./screens/CycleScreen";
@@ -90,6 +90,18 @@ export default function App() {
     await saveProfile(p);
   }, []);
 
+  // "Start over": erase everything on disk, then drop the in-memory profile so the
+  // first-run gating (`!profile` below) re-triggers and OnboardingScreen renders.
+  // profileRef MUST be cleared too — it's the single source of truth, and leaving a
+  // stale profile here would let it leak into the next onboarding's initProfile.
+  // Reset the tab back to the default (Coach) so re-onboarding lands cleanly.
+  const resetApp = useCallback(async (): Promise<void> => {
+    await clearAllData();
+    profileRef.current = null;
+    setProfile(null);
+    setTab("coach");
+  }, []);
+
   useEffect(() => {
     loadProfile()
       .then((p) => {
@@ -155,6 +167,7 @@ export default function App() {
                   initial={profile}
                   updateProfile={updateProfile}
                   onSaved={() => setTab("coach")}
+                  onReset={resetApp}
                 />
               </View>
             </View>

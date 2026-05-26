@@ -124,3 +124,19 @@ export async function clearChat(): Promise<void> {
     console.warn("Flux: failed to clear chat from storage", e);
   }
 }
+
+// "Start over": wipe everything Flux persists — the profile (which carries all the
+// data maps: dayLogs/foodLogs/workoutLogs/savedFoods/savedMeals/weightLog/plan/
+// coachMemory) AND the chat. Used only by the destructive Settings reset so
+// first-run onboarding can be re-tested. Reuses the same key constants as the
+// individual write/clear helpers so there's a single source of truth for keys.
+// Same warn-don't-throw contract as the other write helpers: a failed remove
+// must not reject and crash the caller; the in-memory reset in App.resetApp
+// still proceeds so the UI returns to onboarding regardless.
+export async function clearAllData(): Promise<void> {
+  try {
+    await AsyncStorage.multiRemove([PROFILE_KEY, CHAT_KEY]);
+  } catch (e) {
+    console.warn("Flux: failed to clear all data from storage", e);
+  }
+}
