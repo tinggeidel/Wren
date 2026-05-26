@@ -734,13 +734,31 @@ export async function askCoach(
 // fresh each new day). The context for this call includes the deterministic
 // "WHAT TO NOTICE TODAY" block (forOpener); the prompt's PROACTIVE / NOTICING
 // section tells the Coach to lead with the 1-2 most relevant of those.
-export async function coachKickoff(profile: Profile): Promise<string> {
+//
+// `firstTime` flips this into a richer, one-time WELCOME opener for a freshly
+// onboarded (or Start-over-reset) profile: the Coach synthesizes what she knows
+// about the user from onboarding — name + tone, goal + memory-derived direction,
+// today's code-computed macros (presented as a feel-based starting point), cycle
+// phase or BC line, dietary preferences — and sets expectations for what the
+// user can do here. Every safety constraint still applies; only the kickoff
+// INSTRUCTION changes. Subsequent (returning-user, new-day) kickoffs are
+// unchanged.
+export async function coachKickoff(profile: Profile, firstTime = false): Promise<string> {
   if (!hasApiKey()) return NO_KEY_MSG;
-  const kickoff: ApiMessage = {
-    role: "user",
-    content:
-      "Kick us off for today in your tone. If WHAT TO NOTICE TODAY has anything, LEAD with the one or two most relevant noticings woven naturally into a warm hello (tie them to my cycle phase, energy, plan, or what you remember about me) — pick what matters most, don't list everything. If there's nothing notable, just a genuine hello. Then one line on what to focus on today given my cycle phase and goal. A few sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up.",
-  };
+  const kickoffContent = firstTime
+    ? // FIRST-TIME WELCOME branch. Additive instruction over the same SYSTEM_PROMPT
+      // + context block, so the load-bearing safety contract (ED_SAFETY_RULES at
+      // the end of SYSTEM_PROMPT) and the deterministic numbers from the context
+      // are unchanged. This message just shapes the OPENER content.
+      "This is our very first conversation — she just finished setting Flux up. Give her a warm, thorough welcome in your tone, in a few short paragraphs (conversational, no lists or formatting, no markdown). Cover these things naturally, woven together:\n\n" +
+        "1) Greet her by name and acknowledge her goal. If WHAT YOU REMEMBER ABOUT HER has notes about the direction she's going, her training emphasis, or her motivation (from her onboarding), reflect them briefly in your own words so she feels seen — never quote them verbatim, never mention photos or 'what you uploaded,' and never say she didn't share something. If those notes aren't there, just speak to her goal directly.\n\n" +
+        "2) Present today's daily targets EXPLICITLY using the EXACT numbers from the context (calories, protein, carbs, fat) — do NOT recompute or invent them. Frame them as a feel-based starting point she'll tune by results and how she feels, never a 'must hit' and never about shrinking or earning food. If the context says targets aren't available yet, skip the numbers and say plainly you'll need a couple more details from her later (age, height, weight in Settings) — do not estimate.\n\n" +
+        "3) Acknowledge her cycle context: if she's on hormonal birth control, say so (no natural cycle to sync to) and skip any phase or day prediction. Otherwise name her current phase if it's known and add one short, feel-based note about today; if her phase isn't known yet, say gently you'll learn her rhythm as she logs.\n\n" +
+        "4) If she has dietary preferences or restrictions in her preferences/rules or in long-term memory, reflect them briefly so she knows you'll keep them in mind.\n\n" +
+        "5) Set expectations: tell her she can tell you what she ate, ask what to eat, check her workout plan, or just talk — whatever feels useful. Keep it inviting, not a checklist.\n\n" +
+        "Keep it warm, human, and easy to read. Honor her tone but ED-safety overrides tone — no body-comparison, no weight-loss cheerleading, no pressure."
+    : "Kick us off for today in your tone. If WHAT TO NOTICE TODAY has anything, LEAD with the one or two most relevant noticings woven naturally into a warm hello (tie them to my cycle phase, energy, plan, or what you remember about me) — pick what matters most, don't list everything. If there's nothing notable, just a genuine hello. Then one line on what to focus on today given my cycle phase and goal. A few sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up.";
+  const kickoff: ApiMessage = { role: "user", content: kickoffContent };
   const text = await runConversation(profile, [kickoff], SONNET, undefined, true);
   return text || "(no response)";
 }

@@ -517,13 +517,21 @@ export default function CoachScreen({
         setBooting(false);
         return;
       }
+      // First-time welcome: ONLY when there's no history at all AND the chat key
+      // has never been persisted with a date (lastDate === ""). Both conditions
+      // are required so a returning user with an emptied message list (shouldn't
+      // happen, but defense in depth) can't trigger the welcome again. The chat
+      // key is removed by both clearChat (in-app "Clear") AND clearAllData
+      // (Settings "Start over"); after Start-over the user goes back through
+      // onboarding, then re-mounts here and gets the full personalized welcome.
+      const firstTime = store.messages.length === 0 && !store.lastDate;
       const hadHistory = store.messages.length > 0;
       if (hadHistory) {
         setBooting(false);
         setSending(true);
       }
       try {
-        const reply = await coachKickoff(profile);
+        const reply = await coachKickoff(profile, firstTime);
         if (!active) return;
         const appended: ChatMessage[] = [
           ...store.messages,
