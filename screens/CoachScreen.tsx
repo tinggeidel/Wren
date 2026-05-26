@@ -13,6 +13,8 @@ import {
   Image,
   Modal,
   Keyboard,
+  NativeSyntheticEvent,
+  NativeScrollEvent,
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -65,7 +67,7 @@ import {
 import { WorkoutEntry, WorkoutExercise, PlanDay, WEEKDAY_LABELS } from "../lib/types";
 import BarcodeScanner from "./BarcodeScanner";
 
-const SUGGESTED = ["I had eggs and toast", "What should I eat for dinner?", "How am I doing today?"];
+const SUGGESTED = ["What should I eat?", "How am I doing today?"];
 
 // Friendly label for a day divider.
 function formatDayLabel(d: string): string {
@@ -98,6 +100,10 @@ export default function CoachScreen({
   // Hide the suggested-prompt chips while the input is focused so the keyboard
   // doesn't crowd the screen; they reappear on blur (keyboard dismissed).
   const [inputFocused, setInputFocused] = useState(false);
+  // Also hide the chips while the user has scrolled up to read history; they
+  // reappear once they're back near the bottom of the chat. Default true so the
+  // chips show on open (we start scrolled to the latest message).
+  const [atBottom, setAtBottom] = useState(true);
   const scrollRef = useRef<ScrollView>(null);
   // The Coach screen lives inside App's SafeAreaView (edges top+bottom), which
   // already reserves the top inset ABOVE this KeyboardAvoidingView. With
@@ -123,6 +129,17 @@ export default function CoachScreen({
     profileRef.current = profile;
   }, [profile]);
 
+  // Recompute "is the chat near its bottom?" from a scroll event and update
+  // atBottom only when the boolean actually flips (avoids a setState on every
+  // throttled scroll frame). A small threshold treats "almost at the end" as
+  // bottom, so the chips don't flicker on tiny over-scroll/bounce.
+  const NEAR_BOTTOM = 48;
+  const updateAtBottom = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+    const near = contentOffset.y + layoutMeasurement.height >= contentSize.height - NEAR_BOTTOM;
+    setAtBottom((prev) => (prev === near ? prev : near));
+  };
+
   // When the keyboard opens, keep the latest message in view. onContentSizeChange
   // doesn't fire on keyboard show (the content height is unchanged), so the list
   // would otherwise stay scrolled where it was and the newest bubble can hide
@@ -131,6 +148,10 @@ export default function CoachScreen({
     const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
     const sub = Keyboard.addListener(showEvent, () => {
       scrollRef.current?.scrollToEnd({ animated: true });
+      // Programmatic scroll-to-end doesn't always emit onScroll, so assert the
+      // bottom state directly (chips would otherwise stay hidden if she'd been
+      // scrolled up before focusing).
+      setAtBottom(true);
     });
     return () => sub.remove();
   }, []);
@@ -647,7 +668,15 @@ export default function CoachScreen({
         style={styles.flex}
         contentContainerStyle={styles.messages}
         keyboardDismissMode="on-drag"
-        onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
+        onScroll={updateAtBottom}
+        scrollEventThrottle={16}
+        onContentSizeChange={() => {
+          // New content (a reply, the kickoff, a cleared+rebooted chat) auto-
+          // scrolls to the end, so we're back at the bottom — assert it here
+          // since the programmatic scroll may not emit onScroll.
+          scrollRef.current?.scrollToEnd({ animated: true });
+          setAtBottom(true);
+        }}
       >
         {booting && (
           <View style={styles.booting}>
@@ -685,7 +714,7 @@ export default function CoachScreen({
         {sending && <ActivityIndicator style={styles.spinner} />}
       </ScrollView>
 
-      {!inputFocused && (
+      {!inputFocused && atBottom && (
         <View style={styles.suggestRow}>
           {SUGGESTED.map((s) => (
             <TouchableOpacity
