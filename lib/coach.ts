@@ -1028,6 +1028,12 @@ CALIBRATION SAFETY (overrides anything below it except the final SAFETY block):
 - Supportive and warm, never shaming, never comparison-as-judgment. Do not write anything like "you need to look like this" or "you should be smaller." Frame motivation around what she is moving TOWARD (strength, energy, confidence, capability, how she wants to feel).
 - Keep all string fields short — roughly one sentence each, plain text, no markdown.
 - If she shared only one photo, infer what you can from that one and leave the other side unweighted; don't make up what wasn't shown.
+- COHERENCE between goal and goal_weight (critical — the user picked up a real inconsistency in testing):
+  - If goal is \`build_muscle\`, goal_weight MAY be at or above current weight (a healthy recomp gain).
+  - If goal is \`tone_up\` or \`lose_fat\`, goal_weight MUST be at-or-below current weight — these goals mean leaning out to show existing muscle, NOT adding mass. NEVER return a goal_weight higher than current for these goals.
+  - If goal is \`maintain\` or \`feel_better\`, goal_weight should equal current weight or be omitted entirely.
+  - Cross-check before returning: if your suggested goal_weight contradicts the suggested goal, fix one or the other so they agree, OR omit goal_weight.
+- What "TONED" usually means: for most users, "toned" means LEAN OUT — visible muscle definition through lower body-fat, not adding mass. So when the goal direction reads as "toned," "lean," "slim and strong," etc., the goal is \`tone_up\` and the goal_weight should be the same as or slightly below current. Only return \`build_muscle\` + a higher goal_weight if the goal photo clearly shows a noticeably more muscular physique than the current photo (e.g., visible muscle gain in shoulders/arms/quads).
 
 Report by calling the report_calibration tool exactly once with the fields.
 
