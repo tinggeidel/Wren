@@ -38,6 +38,17 @@ export type Profile = {
   weight: string;
   goalWeight: string;
   activityLevel: ActivityLevel;
+  // Optional tape-measure body measurements (in inches), captured on a dedicated
+  // onboarding "measurements" step and editable later. When all three are set
+  // alongside a parseable height, the US Navy Method body-fat formula
+  // (lib/bodycomp.ts navyBodyFatPercent) becomes the AUTHORITATIVE BF anchor
+  // for the calibration vision call. Skipping any of them leaves the field
+  // undefined — no silent defaults flow into the BF computation. None of these
+  // drive macros: lib/targets.ts is untouched and still owns BMR + the 1200
+  // kcal floor.
+  waistIn?: number;
+  neckIn?: number;
+  hipIn?: number;
   // How calories burned in workouts affect the Food tab's daily budget:
   // "static" = burned shown but target unchanged (safe default); "net" = burned
   // adds to today's budget (eat-back), so harder training = more room to fuel.
@@ -55,7 +66,13 @@ export type Profile = {
   // use-then-discard — only the URI persists. If cache eviction becomes an issue
   // for a prototype these can be migrated to expo-file-system documentDir, but we
   // deliberately don't pull that dep in now to keep the Expo Go install lean.
-  currentPhotoUri?: string;
+  //
+  // 2026-05 photo-quality upgrade: the self-photo split into FRONT and SIDE so
+  // the calibration vision call can triangulate (a single full-body photo is a
+  // weak read). The legacy field `currentPhotoUri` is migrated to
+  // `currentFrontPhotoUri` in loadProfile for back-compat — see lib/storage.ts.
+  currentFrontPhotoUri?: string;
+  currentSidePhotoUri?: string;
   goalPhotoUri?: string;
 };
 

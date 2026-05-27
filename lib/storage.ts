@@ -12,7 +12,14 @@ export async function loadProfile(): Promise<Profile | null> {
   // first-run (return null → onboarding) rather than letting the throw bubble up
   // and leave App.tsx stuck on its loading spinner. Mirrors loadChat below.
   try {
-    const p = JSON.parse(raw) as Profile & { periodLog?: string[] };
+    const p = JSON.parse(raw) as Profile & {
+      periodLog?: string[];
+      // Legacy field from the pre-front/side photo era. Migrated below into
+      // currentFrontPhotoUri so an old profile keeps its photo visible after the
+      // upgrade. The new types deliberately drop this field so future code can't
+      // reach for it accidentally — the cast above is the one read path.
+      currentPhotoUri?: string;
+    };
     // Back-compat: ensure the check-in map exists.
     if (!p.dayLogs || typeof p.dayLogs !== "object") p.dayLogs = {};
     // Feature C: ensure the food/water/workout maps exist on older saved profiles.
@@ -31,6 +38,16 @@ export async function loadProfile(): Promise<Profile | null> {
       }
       delete p.periodLog;
     }
+    // Back-compat: the legacy `currentPhotoUri` field has been split into
+    // `currentFrontPhotoUri` (the calibration anchor) and `currentSidePhotoUri`
+    // (the new side-angle slot, empty for legacy profiles). Copy the old URI
+    // into the front slot so an existing user's onboarding photo doesn't
+    // disappear after this upgrade. Side stays undefined — she'll see an empty
+    // slot in Settings she can fill in if she wants.
+    if (p.currentPhotoUri && !p.currentFrontPhotoUri) {
+      p.currentFrontPhotoUri = p.currentPhotoUri;
+    }
+    delete p.currentPhotoUri;
     return p;
   } catch {
     return null;

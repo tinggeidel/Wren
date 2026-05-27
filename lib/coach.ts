@@ -20,11 +20,20 @@ import { workoutsFor, workoutLabel, caloriesBurnedFor } from "./workouts";
 import { mondayOf, newId, targetForDate, planDayForDate } from "./plan";
 import { memoryLines } from "./memory";
 import { noticingsBlock } from "./patterns";
+// NOTE: lib/bodycomp.ts navyBodyFatPercent is computed by the CALLER
+// (OnboardingScreen) and passed in via CalibrationContext.navyBodyFatPercent —
+// we deliberately don't import the helper here to keep lib/coach.ts decoupled
+// from the bodycomp implementation. The Profile shape and the helper that reads
+// it are an onboarding-screen concern; this file just renders the integer.
 
 // --- Models ---
 // Haiku for routine chat (cheap), Sonnet for complex coaching + the opener.
+// OPUS is reserved for the ONE-OFF onboarding photo calibration call where
+// better visual reasoning meaningfully improves the body-fat / goal read; see
+// calibrateFromPhotos for the cost rationale.
 const HAIKU = "claude-haiku-4-5";
 const SONNET = "claude-sonnet-4-6";
+const OPUS = "claude-opus-4-7";
 
 const MAX_HISTORY = 16; // scoped memory: only the last N messages are sent (now spans days)
 
@@ -1018,7 +1027,8 @@ const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman d
 
 CALIBRATION SAFETY (overrides anything below it except the final SAFETY block):
 - Required fields are short strings: goal_direction, training_emphasis, motivation, goal. Plus OPTIONAL body_fat_range and goal_weight fields — see below.
-- You MAY include a rough body-composition descriptor or approximate range in the optional body_fat_range field — e.g. "athletic, ~20–24%", "recomp candidate, ~25–28%", "average / starting fitness journey". Keep it SHORT and frame it clearly as a rough estimate. Visual body-fat estimation is unreliable, so it must always read as approximate, never a precise number (so "~22–26%", never "23.4%"). If the photos don't support an estimate — e.g. she only uploaded a goal photo, or the current photo isn't a clear self-image of her body — OMIT the field. Do not guess.
+- MEASUREMENT-ANCHORED BODY FAT (critical): if a computed body-fat percentage from her tape-measure measurements (US Navy Method) is provided in the context, USE THAT NUMBER AS THE AUTHORITATIVE ANCHOR for body_fat_range. The measured number is significantly more accurate than visual estimation. Your range should center on that number (±2%) and your qualitative descriptor must match it (e.g. measured 22% -> "athletic, ~20–24%"; measured 28% -> "average build, ~26–30%"). NEVER contradict a measured number with a visual disagreement — if your visual read disagrees significantly with the measurement, briefly mention the discrepancy in motivation in a gentle, non-shaming way ("the measurements read leaner than the photos suggest — bodies surprise us") but TRUST THE MEASUREMENT for body_fat_range. Do not pad the range outward to hedge — keep it tight (±2%) so the user sees the measurement was used.
+- You MAY include a rough body-composition descriptor or approximate range in the optional body_fat_range field — e.g. "athletic, ~20–24%", "recomp candidate, ~25–28%", "average / starting fitness journey". Keep it SHORT and frame it clearly as a rough estimate. Visual body-fat estimation is unreliable, so it must always read as approximate, never a precise number (so "~22–26%", never "23.4%"). If the photos don't support an estimate AND no measured number was provided — e.g. she only uploaded a goal photo, or the current photo isn't a clear self-image of her body — OMIT the field. Do not guess.
 - NEVER include a body-weight estimate of where she IS now, and NEVER include a calorie number or any macro number framed as a target to pursue. The tool schema does not accept those.
 - GOAL (required): pick the single best-fitting goal from the enum ["lose_fat", "tone_up", "build_muscle", "feel_better", "maintain"] based on the photos + her stats + her stated direction. If she shared no self-photo, use the goal direction + her stats to pick. Always pick one — this is the main thing the photo step is for. Never invent a value outside the enum.
 - GOAL WEIGHT (optional): you MAY suggest a reasonable goal weight in "NNN lb" format (e.g. "142 lb") when the photos and her stats support a confident, healthy estimate. The goal weight MUST be a healthy, attainable number for her height and frame. NEVER recommend a goal weight that would put her in an underweight BMI range (under 18.5). If the goal image suggests an extreme/unhealthy ideal, STEER THE GOAL WEIGHT TOWARD A HEALTHY RANGE rather than chasing the ideal — name a target that's strong/healthy, not extreme. If you cannot suggest a healthy goal weight (e.g. she didn't share a self-photo, or stats are missing, or you're not confident), OMIT the field.
@@ -1093,6 +1103,13 @@ export type CalibrationContext = {
   height?: string;
   weight?: string;
   activityLevel?: ActivityLevel;
+  // Optional pre-computed body-fat percentage from her tape-measure
+  // measurements (US Navy Method). When set, the prompt instructs the model to
+  // use this as the AUTHORITATIVE anchor for body_fat_range — measurements
+  // beat visual estimation. Compute via lib/bodycomp.ts navyBodyFatPercent and
+  // pass the integer percent; omit when she didn't fill in all three
+  // measurements (no silent default).
+  navyBodyFatPercent?: number;
   // Read-only snapshot of any durable Coach memory facts already seeded for her
   // (e.g. dietary preferences chosen earlier in onboarding, or, post-onboarding,
   // anything saved through the Coach). Used to anchor calibration on what she's
@@ -1130,35 +1147,60 @@ function parseCalibrationHeightCm(s: string): number | null {
   return null; // ambiguous (e.g. bare "5") — ask instead of guessing
 }
 
-// Run the calibration call. At least one of currentBase64 / goalBase64 should be
-// provided — the caller (onboarding) only invokes this when she shared a photo.
-// The optional `context` lets the caller pass her current stats so the model can
-// actually apply its healthy-BMI guard on goal_weight (without it the prompt is
-// instructing the model on a guard it can't compute).
+// Run the calibration call. At least one of the photos should be provided —
+// the caller (onboarding) only invokes this when she shared something. Two
+// SELF-photos (FRONT + SIDE) plus an optional GOAL photo make this a richer
+// visual read than the previous single-photo version: the model can
+// triangulate front-on impressions with side-profile cues, which materially
+// improves composition reads.
+//
+// The optional `context` lets the caller pass her current stats — most
+// importantly, the pre-computed Navy Method body-fat percent from her
+// tape-measure measurements. When that number is present it ANCHORS
+// body_fat_range (measurements beat visual estimation by a wide margin).
+//
+// COST NOTE: this calls OPUS rather than SONNET. Opus's better visual
+// reasoning is worth the ~5x per-call cost here because calibration is a
+// once-per-onboarding call (bounded to ~1 per user lifecycle). Stays well
+// under the $20/mo prototype cap.
+//
 // On any failure (network, API, parse, empty result) we throw so the caller can
 // soft-skip; onboarding must always complete even if this call fails.
 export async function calibrateFromPhotos(
-  currentBase64?: string,
+  currentFrontBase64?: string,
+  currentSideBase64?: string,
   goalBase64?: string,
   context?: CalibrationContext
 ): Promise<CalibrationResult> {
   if (!hasApiKey()) throw new Error("Coach isn't connected — add your API key in .env.");
-  if (!currentBase64 && !goalBase64) throw new Error("No photo provided.");
+  if (!currentFrontBase64 && !currentSideBase64 && !goalBase64) {
+    throw new Error("No photo provided.");
+  }
 
   // Build a single user message whose content interleaves the photos with a small
   // label so the model knows which is which, followed by the instruction text.
   const content: ContentBlock[] = [];
-  if (currentBase64) {
-    content.push({ type: "text", text: "Photo 1 — her now:" });
+  if (currentFrontBase64) {
+    content.push({ type: "text", text: "Photo 1 — her now, front angle:" });
     content.push({
       type: "image",
-      source: { type: "base64", media_type: "image/jpeg", data: currentBase64 },
+      source: { type: "base64", media_type: "image/jpeg", data: currentFrontBase64 },
+    });
+  }
+  if (currentSideBase64) {
+    content.push({
+      type: "text",
+      text: "Photo 2 — her now, side angle (use together with the front photo to triangulate composition):",
+    });
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: currentSideBase64 },
     });
   }
   if (goalBase64) {
     content.push({
       type: "text",
-      text: "Photo 2 — the direction she's drawn to (a workout, a person, a vibe, a feeling):",
+      text: "Photo 3 — the direction she's drawn to (a workout, a person, a vibe, a feeling):",
     });
     content.push({
       type: "image",
@@ -1177,6 +1219,13 @@ export async function calibrateFromPhotos(
   if (context?.age) ctxLines.push(`- Age: ${context.age}`);
   if (context?.activityLevel) {
     ctxLines.push(`- Activity level: ${ACTIVITY_LABELS[context.activityLevel]}`);
+  }
+  // Measurement-derived body fat — the AUTHORITATIVE anchor when present.
+  // Phrased explicitly so the model knows this is the trustworthy number.
+  if (typeof context?.navyBodyFatPercent === "number") {
+    ctxLines.push(
+      `- Computed body-fat from her measurements (US Navy Method, more accurate than visual): ${context.navyBodyFatPercent}%`
+    );
   }
   const memFacts = context?.coachMemory ?? [];
   if (memFacts.length) {
@@ -1201,7 +1250,11 @@ export async function calibrateFromPhotos(
       "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
-      model: SONNET,
+      // OPUS for the calibration call: better visual reasoning than Sonnet for
+      // the front+side composition read, and this is a once-per-onboarding call
+      // (bounded to ~1 per user lifecycle), so the ~5x per-call cost vs Sonnet
+      // is acceptable — well under the $20/mo prototype cap.
+      model: OPUS,
       max_tokens: 512,
       system: CALIBRATION_SYSTEM,
       tools: [CALIBRATION_TOOL],

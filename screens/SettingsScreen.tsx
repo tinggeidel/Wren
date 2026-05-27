@@ -86,7 +86,13 @@ export default function SettingsScreen({
   // or delete reflects immediately, and the wipe-guard pattern is preserved:
   // every change goes through updateProfile so it composes on the LATEST
   // profile and never clobbers sibling fields from a stale snapshot.
-  const currentPhotoUri = initial?.currentPhotoUri;
+  //
+  // 2026-05 upgrade: the single self-photo split into FRONT + SIDE so the
+  // calibration call can triangulate. Legacy `currentPhotoUri` is migrated to
+  // `currentFrontPhotoUri` in lib/storage.ts on load — Settings only reads the
+  // new fields.
+  const currentFrontPhotoUri = initial?.currentFrontPhotoUri;
+  const currentSidePhotoUri = initial?.currentSidePhotoUri;
   const goalPhotoUri = initial?.goalPhotoUri;
   const [showPicker, setShowPicker] = useState(false);
 
@@ -123,8 +129,16 @@ export default function SettingsScreen({
       // Photo URIs are managed by their own retake/delete handlers (which call
       // updateProfile directly), so the form save just preserves whatever is on
       // the latest profile — no clobber via stale snapshot.
-      currentPhotoUri: p.currentPhotoUri,
+      currentFrontPhotoUri: p.currentFrontPhotoUri,
+      currentSidePhotoUri: p.currentSidePhotoUri,
       goalPhotoUri: p.goalPhotoUri,
+      // Body measurements are preserved as-is from the latest profile —
+      // Settings doesn't edit them yet (only onboarding's measurements step
+      // sets them). Same wipe-guard rule: never blank them from a stale
+      // snapshot.
+      waistIn: p.waistIn,
+      neckIn: p.neckIn,
+      hipIn: p.hipIn,
     };
   }
 
@@ -168,7 +182,10 @@ export default function SettingsScreen({
   // calibration already seeded Coach memory. Re-running would burn API spend
   // every time she retakes, and the qualitative facts (now editable in the
   // memory section above) are the durable signal.
-  async function pickAndStorePhoto(slot: "current" | "goal", source: "camera" | "library") {
+  // Three slots now: "front" + "side" (self-photos) and "goal" (direction).
+  type PhotoSlot = "front" | "side" | "goal";
+
+  async function pickAndStorePhoto(slot: PhotoSlot, source: "camera" | "library") {
     try {
       if (source === "camera") {
         const perm = await ImagePicker.requestCameraPermissionsAsync();
@@ -184,35 +201,39 @@ export default function SettingsScreen({
           : await ImagePicker.launchImageLibraryAsync(opts);
       if (res.canceled || !res.assets?.length) return;
       const uri = res.assets[0].uri;
-      await updateProfile((p) =>
-        slot === "current" ? { ...p, currentPhotoUri: uri } : { ...p, goalPhotoUri: uri }
-      );
+      await updateProfile((p) => {
+        if (slot === "front") return { ...p, currentFrontPhotoUri: uri };
+        if (slot === "side") return { ...p, currentSidePhotoUri: uri };
+        return { ...p, goalPhotoUri: uri };
+      });
     } catch (e: unknown) {
       Alert.alert("Photo error", e instanceof Error ? e.message : String(e));
     }
   }
 
-  function offerRetake(slot: "current" | "goal") {
-    Alert.alert(
-      slot === "current" ? "Replace your current photo" : "Replace your goal photo",
-      "Pick a new photo or skip.",
-      [
-        { text: "Take photo", onPress: () => void pickAndStorePhoto(slot, "camera") },
-        { text: "Choose from library", onPress: () => void pickAndStorePhoto(slot, "library") },
-        { text: "Cancel", style: "cancel" },
-      ]
-    );
+  function offerRetake(slot: PhotoSlot) {
+    const title =
+      slot === "front"
+        ? "Replace your front photo"
+        : slot === "side"
+          ? "Replace your side photo"
+          : "Replace your goal photo";
+    Alert.alert(title, "Pick a new photo or skip.", [
+      { text: "Take photo", onPress: () => void pickAndStorePhoto(slot, "camera") },
+      { text: "Choose from library", onPress: () => void pickAndStorePhoto(slot, "library") },
+      { text: "Cancel", style: "cancel" },
+    ]);
   }
 
-  async function handleDeletePhoto(slot: "current" | "goal") {
+  async function handleDeletePhoto(slot: PhotoSlot) {
     // Clear the URI. We don't try to delete the file from cache — Expo manages
     // the cache and the URI is just a pointer; on next launch the asset may or
     // may not still be there but that's fine because we no longer reference it.
-    await updateProfile((p) =>
-      slot === "current"
-        ? { ...p, currentPhotoUri: undefined }
-        : { ...p, goalPhotoUri: undefined }
-    );
+    await updateProfile((p) => {
+      if (slot === "front") return { ...p, currentFrontPhotoUri: undefined };
+      if (slot === "side") return { ...p, currentSidePhotoUri: undefined };
+      return { ...p, goalPhotoUri: undefined };
+    });
   }
 
   // "Start over": destructive, irreversible wipe. Gate it behind a confirm so a
@@ -451,25 +472,47 @@ export default function SettingsScreen({
         Your Coach already read them during onboarding — they don't change your macros.
       </Text>
 
-      <Text style={styles.label}>Current</Text>
-      {currentPhotoUri ? (
+      <Text style={styles.label}>Front</Text>
+      {currentFrontPhotoUri ? (
         <View style={styles.photoRow}>
-          <Image source={{ uri: currentPhotoUri }} style={styles.photoThumb} />
+          <Image source={{ uri: currentFrontPhotoUri }} style={styles.photoThumb} />
           <View style={styles.photoActions}>
-            <TouchableOpacity style={styles.photoBtn} onPress={() => offerRetake("current")}>
+            <TouchableOpacity style={styles.photoBtn} onPress={() => offerRetake("front")}>
               <Text style={styles.photoBtnText}>Retake</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.photoBtn, styles.photoBtnDanger]}
-              onPress={() => void handleDeletePhoto("current")}
+              onPress={() => void handleDeletePhoto("front")}
             >
               <Text style={styles.photoBtnDangerText}>Delete</Text>
             </TouchableOpacity>
           </View>
         </View>
       ) : (
-        <TouchableOpacity style={styles.photoEmpty} onPress={() => offerRetake("current")}>
-          <Text style={styles.photoEmptyText}>No current photo · tap to add</Text>
+        <TouchableOpacity style={styles.photoEmpty} onPress={() => offerRetake("front")}>
+          <Text style={styles.photoEmptyText}>No front photo · tap to add</Text>
+        </TouchableOpacity>
+      )}
+
+      <Text style={styles.label}>Side</Text>
+      {currentSidePhotoUri ? (
+        <View style={styles.photoRow}>
+          <Image source={{ uri: currentSidePhotoUri }} style={styles.photoThumb} />
+          <View style={styles.photoActions}>
+            <TouchableOpacity style={styles.photoBtn} onPress={() => offerRetake("side")}>
+              <Text style={styles.photoBtnText}>Retake</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.photoBtn, styles.photoBtnDanger]}
+              onPress={() => void handleDeletePhoto("side")}
+            >
+              <Text style={styles.photoBtnDangerText}>Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
+        <TouchableOpacity style={styles.photoEmpty} onPress={() => offerRetake("side")}>
+          <Text style={styles.photoEmptyText}>No side photo · tap to add</Text>
         </TouchableOpacity>
       )}
 

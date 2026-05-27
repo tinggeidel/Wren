@@ -27,6 +27,7 @@ import { toISODate } from "../lib/cycle";
 import { addMemory } from "../lib/memory";
 import { toJpegBase64 } from "../lib/image";
 import { calibrateFromPhotos, hasApiKey, CalibrationResult } from "../lib/coach";
+import { navyBodyFatPercent } from "../lib/bodycomp";
 // Stepper + StepButton live in components/Stepper.tsx so WorkoutScreen's
 // plan-setup sheet can reuse the exact same control (the iOS countdown
 // DateTimePicker there was crashing on the onboarding → workout auto-open
@@ -112,6 +113,21 @@ const WEIGHT_DEFAULT_LB = 150;
 // Default shown to her isn't persisted unless she actually presses a stepper.
 const GOAL_WEIGHT_DEFAULT_LB = 140;
 
+// Body-measurement stepper bounds (inches). Steppers use step=1 (the default);
+// the Stepper component doesn't currently support 0.5 increments without a
+// refactor, so we round measurements to the nearest inch — accurate enough for
+// the Navy formula (±3% vs DEXA already; sub-inch precision rounds out in the
+// log10 terms).
+const WAIST_MIN_IN = 20;
+const WAIST_MAX_IN = 60;
+const WAIST_DEFAULT_IN = 30;
+const NECK_MIN_IN = 10;
+const NECK_MAX_IN = 20;
+const NECK_DEFAULT_IN = 13;
+const HIP_MIN_IN = 25;
+const HIP_MAX_IN = 65;
+const HIP_DEFAULT_IN = 38;
+
 // Format total inches as the ft'in" string parseHeightCm accepts (e.g. 5'6").
 function formatHeight(totalIn: number): string {
   const ft = Math.floor(totalIn / 12);
@@ -131,7 +147,12 @@ function formatHeight(totalIn: number): string {
 // calibration succeeded) OR the manual goal-pick UI (chips + optional goal-
 // weight stepper) when she skipped photos or calibration failed. Both paths
 // land at the same finish(). "start" is the final fork: create a plan vs. chat.
-const STEPS = ["welcome", "basics", "body", "photos", "goals", "cycle", "diet", "tone", "start"] as const;
+// "measurements" sits between body and photos: three optional tape-measure
+// inputs (waist / neck / hip) that feed lib/bodycomp.ts navyBodyFatPercent,
+// which then anchors the photo-calibration call's body_fat_range read. Fully
+// optional — skipping leaves all three undefined (no silent default into the
+// BF computation; lib/bodycomp returns null without all three).
+const STEPS = ["welcome", "basics", "body", "measurements", "photos", "goals", "cycle", "diet", "tone", "start"] as const;
 type Step = (typeof STEPS)[number];
 
 // Where she chose to begin after onboarding (drives App's tab + plan-setup auto-open).
@@ -208,6 +229,19 @@ export default function OnboardingScreen({
   const [goalWeightLb, setGoalWeightLb] = useState(GOAL_WEIGHT_DEFAULT_LB);
   const [goalWeightTouched, setGoalWeightTouched] = useState(false);
 
+  // Body-measurement steppers (waist / neck / hip in inches). Three optional
+  // tape-measure inputs on the new "measurements" step. Same touched-gating as
+  // height/weight: an untouched stepper leaves the field UNDEFINED on the
+  // Profile (no silent default into the Navy BF formula, which returns null
+  // unless all three are set). Defaults are friendly midpoints just for the
+  // stepper display until she presses −/+.
+  const [waistIn, setWaistIn] = useState(WAIST_DEFAULT_IN);
+  const [waistTouched, setWaistTouched] = useState(false);
+  const [neckIn, setNeckIn] = useState(NECK_DEFAULT_IN);
+  const [neckTouched, setNeckTouched] = useState(false);
+  const [hipIn, setHipIn] = useState(HIP_DEFAULT_IN);
+  const [hipTouched, setHipTouched] = useState(false);
+
   // Photo "calibration" step — strictly optional, use-then-discard.
   // We hold the local URI (for the in-step thumbnail) and the base64 (for the
   // single vision call). Both are CLEARED after the call so nothing about the
@@ -217,8 +251,15 @@ export default function OnboardingScreen({
   // calibrateFromPhotos for the safety contract (no body-weight estimate of
   // where she is now, no calorie targets, healthy-BMI guard on goal weight,
   // macros still flow through lib/targets.ts with its BMR floor).
-  const [currentUri, setCurrentUri] = useState<string | null>(null);
-  const [currentBase64, setCurrentBase64] = useState<string | null>(null);
+  //
+  // 2026-05 upgrade: the self-photo is now FRONT + SIDE (two angles → better
+  // composition triangulation in the vision call). Both are optional; the
+  // calibration runs whenever ANY photo is provided (front, side, goal, or any
+  // combination) — the model just gets less to work with when fewer are sent.
+  const [currentFrontUri, setCurrentFrontUri] = useState<string | null>(null);
+  const [currentFrontBase64, setCurrentFrontBase64] = useState<string | null>(null);
+  const [currentSideUri, setCurrentSideUri] = useState<string | null>(null);
+  const [currentSideBase64, setCurrentSideBase64] = useState<string | null>(null);
   const [goalUri, setGoalUri] = useState<string | null>(null);
   const [goalBase64, setGoalBase64] = useState<string | null>(null);
   const [calibrating, setCalibrating] = useState(false);
@@ -230,6 +271,12 @@ export default function OnboardingScreen({
   // user can SEE what her photos produced and adjust the picked goal / goal
   // weight before continuing. Cleared back to null on retake/skip. Local-only.
   const [calibrationResult, setCalibrationResult] = useState<CalibrationResult | null>(null);
+  // Tracks whether the Navy BF measurement was used as the anchor on the most
+  // recent calibration call. Drives the label on the composition row in the
+  // goals-step auto card: "Composition (Navy Method, more accurate)" when the
+  // measurement anchored it, "Composition (rough estimate)" when it was a
+  // pure visual estimate.
+  const [calibrationUsedNavyBF, setCalibrationUsedNavyBF] = useState(false);
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -307,12 +354,33 @@ export default function OnboardingScreen({
     setGoalWeightLb(next);
     setGoalWeightTouched(true);
   }
+  // Measurement-step stepper handlers. Identical touched-gating contract to
+  // height/weight: a stepper that's never pressed leaves the field undefined
+  // on the Profile (no silent default into the Navy BF formula, which then
+  // returns null because all three measurements are required).
+  function onWaistChange(next: number) {
+    setWaistIn(next);
+    setWaistTouched(true);
+  }
+  function onNeckChange(next: number) {
+    setNeckIn(next);
+    setNeckTouched(true);
+  }
+  function onHipChange(next: number) {
+    setHipIn(next);
+    setHipTouched(true);
+  }
 
   // --- Photo step helpers ----------------------------------------------------
   // Same image pipeline as the Coach + Food photo flows: ImagePicker for the
   // picker, toJpegBase64 for the resized JPEG the vision API needs. We never
   // persist either uri or base64 — they live in component state only.
-  async function pickPhoto(slot: "current" | "goal", source: "camera" | "library") {
+  //
+  // Three slots after the 2026-05 upgrade: "front" + "side" (self-photos for
+  // composition triangulation) and "goal" (direction reference).
+  type PhotoSlot = "front" | "side" | "goal";
+
+  async function pickPhoto(slot: PhotoSlot, source: "camera" | "library") {
     try {
       if (source === "camera") {
         const perm = await ImagePicker.requestCameraPermissionsAsync();
@@ -335,9 +403,12 @@ export default function OnboardingScreen({
         Alert.alert("Couldn't read that photo", "Try another one.");
         return;
       }
-      if (slot === "current") {
-        setCurrentUri(asset.uri);
-        setCurrentBase64(base64);
+      if (slot === "front") {
+        setCurrentFrontUri(asset.uri);
+        setCurrentFrontBase64(base64);
+      } else if (slot === "side") {
+        setCurrentSideUri(asset.uri);
+        setCurrentSideBase64(base64);
       } else {
         setGoalUri(asset.uri);
         setGoalBase64(base64);
@@ -347,22 +418,27 @@ export default function OnboardingScreen({
     }
   }
 
-  function offerPickPhoto(slot: "current" | "goal") {
-    Alert.alert(
-      slot === "current" ? "Add a photo of you now" : "Add a photo of where you want to go",
-      "Optional — you can always skip.",
-      [
-        { text: "Take photo", onPress: () => void pickPhoto(slot, "camera") },
-        { text: "Choose from library", onPress: () => void pickPhoto(slot, "library") },
-        { text: "Cancel", style: "cancel" },
-      ]
-    );
+  function offerPickPhoto(slot: PhotoSlot) {
+    const title =
+      slot === "front"
+        ? "Add a front photo"
+        : slot === "side"
+          ? "Add a side photo"
+          : "Add a photo of where you want to go";
+    Alert.alert(title, "Optional — you can always skip.", [
+      { text: "Take photo", onPress: () => void pickPhoto(slot, "camera") },
+      { text: "Choose from library", onPress: () => void pickPhoto(slot, "library") },
+      { text: "Cancel", style: "cancel" },
+    ]);
   }
 
-  function removePhoto(slot: "current" | "goal") {
-    if (slot === "current") {
-      setCurrentUri(null);
-      setCurrentBase64(null);
+  function removePhoto(slot: PhotoSlot) {
+    if (slot === "front") {
+      setCurrentFrontUri(null);
+      setCurrentFrontBase64(null);
+    } else if (slot === "side") {
+      setCurrentSideUri(null);
+      setCurrentSideBase64(null);
     } else {
       setGoalUri(null);
       setGoalBase64(null);
@@ -379,15 +455,36 @@ export default function OnboardingScreen({
   // discipline around it, not a free-text memory fact). On failure
   // (network/API/parse/no key/no photos), returns { result: null, facts: [] }
   // so we soft-skip into the manual goals card path.
-  async function runCalibration(): Promise<{ result: CalibrationResult | null; facts: string[] }> {
-    const cur = currentBase64;
+  async function runCalibration(): Promise<{
+    result: CalibrationResult | null;
+    facts: string[];
+    usedNavyBF: boolean;
+  }> {
+    const front = currentFrontBase64;
+    const side = currentSideBase64;
     const dst = goalBase64;
     // Always drop the base64 from state after the call — use-then-discard.
     // We do this BEFORE the await so even a navigation interrupt can't leak it.
-    setCurrentBase64(null);
+    setCurrentFrontBase64(null);
+    setCurrentSideBase64(null);
     setGoalBase64(null);
-    if (!cur && !dst) return { result: null, facts: [] };
-    if (!hasApiKey()) return { result: null, facts: [] };
+    if (!front && !side && !dst) return { result: null, facts: [], usedNavyBF: false };
+    if (!hasApiKey()) return { result: null, facts: [], usedNavyBF: false };
+
+    // Compute the measurement-derived body-fat percent BEFORE the call. The
+    // Navy formula requires all three measurements + a parseable height; any
+    // missing piece returns null and the calibration prompt falls back to its
+    // visual-estimate rules. Building a partial Profile here (just the fields
+    // navyBodyFatPercent reads) is safe — the helper only touches waist/neck/
+    // hip and height.
+    const partial: Profile = {
+      waistIn: waistTouched ? waistIn : undefined,
+      neckIn: neckTouched ? neckIn : undefined,
+      hipIn: hipTouched ? hipIn : undefined,
+      height: height || "",
+    } as unknown as Profile;
+    const navyBF = navyBodyFatPercent(partial);
+
     try {
       // Pass the stats she's filled in so far so the model can apply the
       // healthy-BMI guard on goal_weight (deterministic floor still re-checks
@@ -395,13 +492,19 @@ export default function OnboardingScreen({
       // which case the model is told they're unknown and will omit goal_weight.
       // coachMemory is empty during fresh onboarding; included for forward-
       // compatibility if calibrateFromPhotos is ever called post-onboarding.
-      const result = await calibrateFromPhotos(cur ?? undefined, dst ?? undefined, {
-        age: age || undefined,
-        height: height || undefined,
-        weight: weight || undefined,
-        activityLevel,
-        coachMemory: [],
-      });
+      const result = await calibrateFromPhotos(
+        front ?? undefined,
+        side ?? undefined,
+        dst ?? undefined,
+        {
+          age: age || undefined,
+          height: height || undefined,
+          weight: weight || undefined,
+          activityLevel,
+          navyBodyFatPercent: navyBF ?? undefined,
+          coachMemory: [],
+        }
+      );
       const facts: string[] = [];
       if (result.goal_direction) facts.push(`goal direction: ${result.goal_direction}`);
       if (result.training_emphasis) facts.push(`training emphasis: ${result.training_emphasis}`);
@@ -409,10 +512,10 @@ export default function OnboardingScreen({
       // Optional — the model omits this when photos don't support an estimate.
       // The string already comes back hedged (e.g. "~22–26%") per the prompt.
       if (result.body_fat_range) facts.push(`body composition estimate: ${result.body_fat_range}`);
-      return { result, facts };
+      return { result, facts, usedNavyBF: navyBF != null };
     } catch {
       // Soft-skip: no facts seeded, no scary error to her face.
-      return { result: null, facts: [] };
+      return { result: null, facts: [], usedNavyBF: false };
     }
   }
 
@@ -437,12 +540,13 @@ export default function OnboardingScreen({
     }
     setCalibrating(true);
     try {
-      const { result, facts } = await runCalibration();
+      const { result, facts, usedNavyBF } = await runCalibration();
       // Only OVERWRITE state on success — a null result must not clobber a
       // prior good calibration if there ever is one to clobber.
       if (result) {
         setCalibratedFacts(facts);
         setCalibrationResult(result);
+        setCalibrationUsedNavyBF(usedNavyBF);
         // Pre-seed the goal pick from calibration. The chip swap UI on the
         // goals step renders this as pre-selected; she can tap a different
         // chip to change. If the model didn't return a valid enum value,
@@ -500,11 +604,13 @@ export default function OnboardingScreen({
 
   // Build the complete first Profile from the answers and persist it. We start
   // from the SAME empty base Settings would (every data map empty), then overlay
-  // the collected fields. Profile is the documented shape plus two new optional
-  // fields (currentPhotoUri / goalPhotoUri) that hold the local photo URIs when
-  // she shared photos — base64 is still use-then-discard, only the URI persists.
-  // Dietary chips + notes are also folded into dietaryRules (free text the Coach
-  // reads in context) AND seeded into coachMemory below as durable facts.
+  // the collected fields. Profile is the documented shape plus optional photo
+  // URI fields (currentFrontPhotoUri / currentSidePhotoUri / goalPhotoUri) that
+  // hold the local photo URIs when she shared photos — base64 is still
+  // use-then-discard, only the URI persists. Optional waist/neck/hip measurements
+  // also flow through, touched-gated so a skipped measurements step leaves them
+  // undefined (Navy BF returns null without all three). Dietary chips + notes
+  // are folded into dietaryRules AND seeded into coachMemory as durable facts.
   async function finish() {
     if (saving) return;
     setSaving(true);
@@ -559,11 +665,18 @@ export default function OnboardingScreen({
         activityLevel,
         calorieMode: "static", // safe default; she can switch to net in Settings
         coachMemory: [],
-        // Photo URIs only land on the Profile if she actually shared one; both
+        // Photo URIs only land on the Profile if she actually shared one; any
         // remain undefined when the photo step was skipped. URIs are the
         // expo-image-picker cache URIs; base64 is dropped in runCalibration.
-        currentPhotoUri: currentUri ?? undefined,
+        currentFrontPhotoUri: currentFrontUri ?? undefined,
+        currentSidePhotoUri: currentSideUri ?? undefined,
         goalPhotoUri: goalUri ?? undefined,
+        // Body measurements (tape-measure) — touched-gated like height/weight:
+        // an untouched stepper leaves the field undefined on the Profile (no
+        // silent default into the Navy BF formula, which then returns null).
+        waistIn: waistTouched ? waistIn : undefined,
+        neckIn: neckTouched ? neckIn : undefined,
+        hipIn: hipTouched ? hipIn : undefined,
       };
 
       // Seed durable Coach memory so the Coach knows her restrictions from message
@@ -748,6 +861,61 @@ export default function OnboardingScreen({
           </View>
         )}
 
+        {step === "measurements" && (
+          // Optional body measurements. Three steppers — waist / neck / hip
+          // in inches — feed lib/bodycomp.ts navyBodyFatPercent, which is a far
+          // more reliable body-composition read than visual estimation from
+          // photos. The number lands in the calibration prompt as the
+          // AUTHORITATIVE anchor for body_fat_range. ALL three are required for
+          // a result; any missing one returns null and the photo step falls
+          // back to a visual estimate. Macros are still computed in
+          // lib/targets.ts with its BMR / 1200 kcal floor — measurements never
+          // drive macro math.
+          <View>
+            <Text style={styles.title}>Optional: body measurements</Text>
+            <Text style={styles.subtitle}>
+              Three quick numbers from a tape measure get you a much more accurate body-comp read
+              than photos alone. Skip if you don't have a tape.
+            </Text>
+
+            <Text style={styles.label}>Waist (in)</Text>
+            <Stepper
+              value={waistIn}
+              min={WAIST_MIN_IN}
+              max={WAIST_MAX_IN}
+              display={`${waistIn} in`}
+              onChange={onWaistChange}
+            />
+            <Text style={styles.hint}>Measure the narrowest point, just above the navel.</Text>
+
+            <Text style={styles.label}>Neck (in)</Text>
+            <Stepper
+              value={neckIn}
+              min={NECK_MIN_IN}
+              max={NECK_MAX_IN}
+              display={`${neckIn} in`}
+              onChange={onNeckChange}
+            />
+            <Text style={styles.hint}>Measure just below the larynx.</Text>
+
+            <Text style={styles.label}>Hip (in)</Text>
+            <Stepper
+              value={hipIn}
+              min={HIP_MIN_IN}
+              max={HIP_MAX_IN}
+              display={`${hipIn} in`}
+              onChange={onHipChange}
+            />
+            <Text style={styles.hint}>Measure the widest point of your hips/glutes.</Text>
+
+            <Text style={styles.hint}>
+              {waistTouched && neckTouched && hipTouched
+                ? "All three set — your Coach will use these for a more accurate body-comp read."
+                : "All three needed for a body-comp read — or skip the whole step."}
+            </Text>
+          </View>
+        )}
+
         {step === "goals" && calibrationResult && calibratedFacts.length > 0 && (
           // AUTO-GOALS card: rendered ONLY when photos succeeded AND the
           // calibration produced at least one qualitative fact. Shows the
@@ -825,11 +993,22 @@ export default function OnboardingScreen({
               ) : null}
               {calibrationResult.body_fat_range ? (
                 <View style={styles.confirmRow}>
-                  <Text style={styles.confirmLabel}>Composition (rough estimate)</Text>
-                  <Text style={styles.confirmValue}>{calibrationResult.body_fat_range}</Text>
-                  <Text style={styles.confirmCaveat}>
-                    Visual estimates are rough — take with a grain of salt.
+                  {/* Label changes based on whether the Navy Method measurement
+                      was used as the anchor. Measurement-anchored reads are
+                      significantly more accurate than visual estimation, so
+                      we call that out; pure-visual reads keep the original
+                      "rough estimate" caveat to set honest expectations. */}
+                  <Text style={styles.confirmLabel}>
+                    {calibrationUsedNavyBF
+                      ? "Composition (Navy Method, more accurate)"
+                      : "Composition (rough estimate)"}
                   </Text>
+                  <Text style={styles.confirmValue}>{calibrationResult.body_fat_range}</Text>
+                  {!calibrationUsedNavyBF && (
+                    <Text style={styles.confirmCaveat}>
+                      Visual estimates are rough — take with a grain of salt.
+                    </Text>
+                  )}
                 </View>
               ) : null}
             </View>
@@ -888,9 +1067,9 @@ export default function OnboardingScreen({
           <View>
             <Text style={styles.title}>Your goals in pictures</Text>
             <Text style={styles.subtitle}>
-              Optional: a photo of you now, and one that captures where you want to go — a workout,
-              a person, a vibe, a feeling. Your Coach uses it to understand the direction you're
-              going.
+              Optional: a front and side photo of you now, and one that captures where you want to
+              go — a workout, a person, a vibe, a feeling. Your Coach uses them to understand the
+              direction you're going.
             </Text>
             {/* Load-bearing transparency line: macros stay computed from her stats
                 with a safety floor. This is the safety contract she sees on this
@@ -900,21 +1079,40 @@ export default function OnboardingScreen({
               numbers.
             </Text>
 
-            <Text style={styles.label}>A photo of you now</Text>
-            {currentUri ? (
+            {/* Tips card — short, skimmable guidance. NOT a separate step (per
+                product brief): it lives at the top of the photos step so she
+                can glance at it while taking/picking photos. */}
+            <View style={styles.tipsCard}>
+              <Text style={styles.tipsTitle}>Tips for best results</Text>
+              <Text style={styles.tipsItem}>• Full body visible — head to feet.</Text>
+              <Text style={styles.tipsItem}>• Plain background, neutral lighting.</Text>
+              <Text style={styles.tipsItem}>
+                • Tight athletic wear (sports bra + shorts, or fitted tee + leggings).
+              </Text>
+              <Text style={styles.tipsItem}>
+                • Arms slightly away from torso so your sides are visible.
+              </Text>
+              <Text style={styles.tipsItem}>• Front AND side angle for the self-photos — both help a lot.</Text>
+              <Text style={styles.tipsItem}>
+                • Goal photo: anything that captures the direction (a workout, a person, a vibe).
+              </Text>
+            </View>
+
+            <Text style={styles.label}>Front photo</Text>
+            {currentFrontUri ? (
               <View style={styles.photoSlotFilled}>
-                <Image source={{ uri: currentUri }} style={styles.photoThumb} />
+                <Image source={{ uri: currentFrontUri }} style={styles.photoThumb} />
                 <View style={styles.photoSlotActions}>
                   <TouchableOpacity
                     style={styles.photoSlotBtn}
-                    onPress={() => offerPickPhoto("current")}
+                    onPress={() => offerPickPhoto("front")}
                     disabled={calibrating}
                   >
                     <Text style={styles.photoSlotBtnText}>Replace</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.photoSlotBtn}
-                    onPress={() => removePhoto("current")}
+                    onPress={() => removePhoto("front")}
                     disabled={calibrating}
                   >
                     <Text style={styles.photoSlotBtnText}>Remove</Text>
@@ -924,14 +1122,45 @@ export default function OnboardingScreen({
             ) : (
               <TouchableOpacity
                 style={styles.photoSlotEmpty}
-                onPress={() => offerPickPhoto("current")}
+                onPress={() => offerPickPhoto("front")}
                 disabled={calibrating}
               >
-                <Text style={styles.photoSlotEmptyText}>Tap to add a photo · optional</Text>
+                <Text style={styles.photoSlotEmptyText}>Tap to add a front photo · optional</Text>
               </TouchableOpacity>
             )}
 
-            <Text style={styles.label}>A photo of where you want to go</Text>
+            <Text style={styles.label}>Side photo</Text>
+            {currentSideUri ? (
+              <View style={styles.photoSlotFilled}>
+                <Image source={{ uri: currentSideUri }} style={styles.photoThumb} />
+                <View style={styles.photoSlotActions}>
+                  <TouchableOpacity
+                    style={styles.photoSlotBtn}
+                    onPress={() => offerPickPhoto("side")}
+                    disabled={calibrating}
+                  >
+                    <Text style={styles.photoSlotBtnText}>Replace</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.photoSlotBtn}
+                    onPress={() => removePhoto("side")}
+                    disabled={calibrating}
+                  >
+                    <Text style={styles.photoSlotBtnText}>Remove</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.photoSlotEmpty}
+                onPress={() => offerPickPhoto("side")}
+                disabled={calibrating}
+              >
+                <Text style={styles.photoSlotEmptyText}>Tap to add a side photo · optional</Text>
+              </TouchableOpacity>
+            )}
+
+            <Text style={styles.label}>Goal photo</Text>
             {goalUri ? (
               <View style={styles.photoSlotFilled}>
                 <Image source={{ uri: goalUri }} style={styles.photoThumb} />
@@ -959,7 +1188,7 @@ export default function OnboardingScreen({
                 disabled={calibrating}
               >
                 <Text style={styles.photoSlotEmptyText}>
-                  Tap to add a photo · a workout, a person, a vibe — optional
+                  Tap to add a goal photo · a workout, a person, a vibe — optional
                 </Text>
               </TouchableOpacity>
             )}
@@ -1171,7 +1400,7 @@ export default function OnboardingScreen({
                   : "Meet your Coach"
               : step === "photos" && calibrating
                 ? "Reading…"
-                : step === "photos" && !currentUri && !goalUri
+                : step === "photos" && !currentFrontUri && !currentSideUri && !goalUri
                   ? "Skip"
                   : "Next"}
           </Text>
@@ -1254,6 +1483,21 @@ const styles = StyleSheet.create({
     backgroundColor: "#faf9fd",
   },
   photoSlotEmptyText: { color: ACCENT, fontWeight: "600", fontSize: 14, textAlign: "center", paddingHorizontal: 12 },
+  // Photo-quality tips card — short, skimmable bullets at the top of the
+  // photos step. Visually a soft accent block (same palette as the
+  // confirmation card below) so it reads as guidance, not navigation.
+  tipsCard: {
+    borderWidth: 1,
+    borderColor: "#e7e3f2",
+    backgroundColor: "#faf9fd",
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 14,
+    marginBottom: 6,
+    gap: 4,
+  },
+  tipsTitle: { fontSize: 13, fontWeight: "700", color: ACCENT, letterSpacing: 0.3, marginBottom: 4 },
+  tipsItem: { fontSize: 13, color: "#444", lineHeight: 18 },
   photoSlotFilled: {
     flexDirection: "row",
     alignItems: "center",
