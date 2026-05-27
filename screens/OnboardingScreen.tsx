@@ -187,6 +187,14 @@ export default function OnboardingScreen({
   const [showPicker, setShowPicker] = useState(false);
   const [dietChips, setDietChips] = useState<string[]>([]);
   const [dietNotes, setDietNotes] = useState("");
+  // Optional free-text "personal goals" field on the goals step. Local-only
+  // string state — NOT persisted on the Profile. At finish() it's split into
+  // short facts and seeded into coachMemory via addMemory (same pipeline the
+  // dietary chips/notes already use). Blank leaves coachMemory untouched (no
+  // silent default). Same field appears on both goals-step render paths
+  // (auto-card + manual-card) so the user gets it whether or not photos
+  // succeeded.
+  const [personalGoalsText, setPersonalGoalsText] = useState("");
   const [tone, setTone] = useState<Tone>("bestie");
   const [startDest, setStartDest] = useState<StartDest>("coach");
   const [saving, setSaving] = useState(false);
@@ -690,6 +698,26 @@ export default function OnboardingScreen({
       const note = dietNotes.trim();
       if (note) facts.push(note);
       for (const f of calibratedFacts) facts.push(f);
+
+      // Personal goals free-text from the goals step. Split on commas, semicolons,
+      // and the word "and" (loose, case-insensitive, word-boundary), filter blanks,
+      // cap at ~8 facts (defense against a paragraph blowing the MAX_COACH_MEMORY=40
+      // cap), and prefix each with "personal goal: " so it reads distinctly from
+      // diet facts in Settings → "What your Coach remembers about you" AND in the
+      // Coach's context block. We do NOT filter/sanitize the text itself — trust
+      // the user; ED_SAFETY_RULES + the Coach prompt govern how the Coach responds
+      // to whatever's in memory. Empty input seeds nothing (no silent default).
+      const personalGoalsTrimmed = personalGoalsText.trim();
+      if (personalGoalsTrimmed) {
+        const goalFacts = personalGoalsTrimmed
+          .split(/\s*,\s*|\s*;\s*|\s+and\s+/i)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+          .slice(0, 8)
+          .map((s) => `personal goal: ${s}`);
+        for (const f of goalFacts) facts.push(f);
+      }
+
       for (const f of facts) profile = addMemory(profile, f);
 
       await initProfile(profile);
@@ -966,6 +994,22 @@ export default function OnboardingScreen({
               ))}
             </View>
 
+            {/* Personal goals free-text. Optional. Whatever she types here is
+                split at finish() into short "personal goal: ..." memory facts
+                via addMemory (same pipeline as dietary chips/notes). Empty
+                input seeds nothing. Style matches the dietary-notes input on
+                the diet step (input + multiline). */}
+            <Text style={styles.label}>
+              Personal goals <Text style={styles.labelMuted}>(optional)</Text>
+            </Text>
+            <TextInput
+              style={[styles.input, styles.multiline]}
+              value={personalGoalsText}
+              onChangeText={setPersonalGoalsText}
+              placeholder="My goal is snatched waist, build glutes, defined leaner arms..."
+              multiline
+            />
+
             <Text style={styles.label}>Goal weight</Text>
             <Stepper
               value={goalWeightLb}
@@ -1063,6 +1107,21 @@ export default function OnboardingScreen({
             <Text style={styles.hint}>
               However you frame it is fine — your Coach meets you where you are.
             </Text>
+
+            {/* Personal goals free-text. Same field as on the auto-card path
+                above — kept here too so she gets it whether or not photos
+                succeeded. Style matches the dietary-notes input on the diet
+                step. Empty seeds nothing. */}
+            <Text style={styles.label}>
+              Personal goals <Text style={styles.labelMuted}>(optional)</Text>
+            </Text>
+            <TextInput
+              style={[styles.input, styles.multiline]}
+              value={personalGoalsText}
+              onChangeText={setPersonalGoalsText}
+              placeholder="My goal is snatched waist, build glutes, defined leaner arms..."
+              multiline
+            />
 
             <Text style={styles.label}>Goal weight (optional)</Text>
             <Stepper
@@ -1445,6 +1504,10 @@ const styles = StyleSheet.create({
   body: { fontSize: 16, color: "#333", marginBottom: 14, lineHeight: 23 },
   bodyMuted: { fontSize: 13, color: "#999", marginTop: 6 },
   label: { fontSize: 15, fontWeight: "600", marginTop: 16, marginBottom: 6 },
+  // Muted "(optional)" suffix rendered inline inside a label. Same baseline as
+  // the parent Text (so they sit on one line) but lighter weight + softer
+  // color so the eye lands on the actual label text first.
+  labelMuted: { fontSize: 13, fontWeight: "400", color: "#888" },
   input: {
     borderWidth: 1,
     borderColor: "#ddd",
