@@ -57,10 +57,23 @@ import {
   isWeekComplete,
 } from "../lib/plan";
 import { generateWeekPlan } from "../lib/coach";
-import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
+// Shared with OnboardingScreen (height/weight/goal-weight steppers). Replaced
+// the iOS countdown DateTimePicker that previously hosted "Time per session" —
+// the picker was the crash surface on the onboarding → workout auto-open
+// transition (Modal slide-in + UIDatePicker mount during the same commit as
+// six simultaneous screen mounts). Stepper is pure RN, no native bridge.
+import { Stepper } from "../components/Stepper";
 
 const ACCENT = "#7c3aed";
 const BURN = "#e8833a";
+
+// Plan-setup session-length stepper bounds. 15-min floor (anything shorter is
+// effectively a walk, not a workout); 2-hour ceiling (covers long-run / long-
+// gym days); 5-min increments so taps feel meaningful and the press-and-hold
+// repeat doesn't blow past a usable range.
+const SESSION_MIN_MINUTES = 15;
+const SESSION_MAX_MINUTES = 120;
+const SESSION_STEP_MINUTES = 5;
 
 const PHASE_LEAN: Record<string, string> = {
   menstrual: "Many women keep it gentler now — mobility, walks, lighter lifts. Go by how you feel.",
@@ -69,13 +82,8 @@ const PHASE_LEAN: Record<string, string> = {
   luteal: "Many women feel steadier with moderate, lower-volume work and a bit more recovery.",
 };
 
-// The countdown picker works in Dates — encode minutes as a time-of-day.
-function minutesToDate(min: number): Date {
-  return new Date(2000, 0, 1, Math.floor(min / 60), min % 60, 0);
-}
-function dateToMinutes(d: Date): number {
-  return d.getHours() * 60 + d.getMinutes();
-}
+// Pretty-print minutes as "1 hr 30 min" / "45 min" — used in the plan-setup
+// stepper hint and elsewhere in this screen.
 function durationLabel(min: number): string {
   const h = Math.floor(min / 60);
   const m = min % 60;
@@ -172,7 +180,10 @@ export default function WorkoutScreen({
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState("");
   const [spWorkoutDays, setSpWorkoutDays] = useState<Weekday[]>([]);
-  const [spDuration, setSpDuration] = useState<Date>(() => minutesToDate(45));
+  // Session length in minutes (plain number). Was previously a Date encoded
+  // for the iOS countdown DateTimePicker; replaced by a cross-platform Stepper
+  // that reads/writes minutes directly. Default 45 matches the prior default.
+  const [spSessionMinutes, setSpSessionMinutes] = useState<number>(45);
   const [spAccess, setSpAccess] = useState<string[]>([]);
   const [spEquip, setSpEquip] = useState("");
   const [spClasses, setSpClasses] = useState("");
@@ -195,7 +206,7 @@ export default function WorkoutScreen({
   function openPlanSetup() {
     const s = plan?.setup;
     setSpWorkoutDays(s?.workoutDays ?? []);
-    setSpDuration(minutesToDate(s?.sessionMinutes ?? 45));
+    setSpSessionMinutes(s?.sessionMinutes ?? 45);
     setSpAccess(s?.access ?? []);
     setSpEquip(s?.equipment ?? "");
     setSpClasses(s?.classes ?? "");
@@ -210,10 +221,23 @@ export default function WorkoutScreen({
   // the no-plan CTA opens, so she lands straight in plan setup. Guard the initial
   // 0 so a normal mount never auto-opens. Disable the exhaustive-deps lint: this
   // must fire ONLY when the signal changes, not when openPlanSetup's closure does.
+  //
+  // CRASH FIX: defer the auto-open one tick. On a fresh-onboarding completion,
+  // OnboardingScreen unmounts and all six main screens (incl. WorkoutScreen)
+  // mount in the SAME commit. The original crash surface — an iOS countdown
+  // DateTimePicker mounting inside this Modal during that transition — has
+  // been removed (replaced with a pure-RN Stepper, see below). The
+  // `setTimeout(0)` stays as belt-and-suspenders for any remaining native
+  // bridge timing issue on this transition (Modal slide-in during the same
+  // commit as six screen mounts). We also clear the timer on unmount so a
+  // navigate-away mid-defer doesn't fire setState on an unmounted screen.
   useEffect(() => {
     if (!openSetupSignal) return;
     setActiveTab("plan");
-    openPlanSetup();
+    const t = setTimeout(() => {
+      openPlanSetup();
+    }, 0);
+    return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openSetupSignal]);
 
@@ -230,7 +254,7 @@ export default function WorkoutScreen({
     const setup: PlanSetup = {
       daysPerWeek: days.length || 4,
       workoutDays: days.length ? days : undefined,
-      sessionMinutes: dateToMinutes(spDuration) || undefined,
+      sessionMinutes: spSessionMinutes || undefined,
       access: spAccess.length ? spAccess : ["home"],
       equipment: spEquip.trim() || undefined,
       classes: spClasses.trim() || undefined,
@@ -1130,25 +1154,21 @@ export default function WorkoutScreen({
               <Text style={styles.miniLabel}>The days you don't pick become rest days.</Text>
 
               <Text style={styles.fieldLabel}>Time per session</Text>
-              {Platform.OS === "ios" ? (
-                <View style={styles.timerWrap}>
-                  <DateTimePicker
-                    value={spDuration}
-                    mode="countdown"
-                    display="spinner"
-                    onChange={(_e: DateTimePickerEvent, d?: Date) => d && setSpDuration(d)}
-                  />
-                </View>
-              ) : (
-                <TextInput
-                  style={styles.input}
-                  value={String(dateToMinutes(spDuration))}
-                  onChangeText={(t) => setSpDuration(minutesToDate(parseInt(t, 10) || 0))}
-                  keyboardType="numeric"
-                  placeholder="minutes"
-                />
-              )}
-              <Text style={styles.miniLabel}>{durationLabel(dateToMinutes(spDuration))} per workout.</Text>
+              {/* Cross-platform Stepper. Range 15–120 min, step 5. Hold −/+ to
+                  repeat. Replaces the iOS countdown DateTimePicker + Android
+                  numeric TextInput pair — the picker was the crash surface on
+                  the onboarding → workout auto-open transition. Pre-populated
+                  from the saved plan setup if any (see openPlanSetup); otherwise
+                  defaults to 45 min. */}
+              <Stepper
+                value={spSessionMinutes}
+                min={SESSION_MIN_MINUTES}
+                max={SESSION_MAX_MINUTES}
+                step={SESSION_STEP_MINUTES}
+                display={durationLabel(spSessionMinutes)}
+                onChange={setSpSessionMinutes}
+              />
+              <Text style={styles.miniLabel}>{durationLabel(spSessionMinutes)} per workout.</Text>
 
               <Text style={styles.fieldLabel}>Where you train</Text>
               <View style={styles.chipWrap}>
@@ -1346,7 +1366,6 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 14, color: "#333" },
   chipTextActive: { color: "#fff", fontWeight: "600" },
 
-  timerWrap: { alignItems: "center", marginTop: 4 },
   addExBtn: { borderWidth: 1.5, borderColor: ACCENT, borderRadius: 10, paddingVertical: 11, alignItems: "center", marginTop: 14 },
   addExBtnText: { color: ACCENT, fontWeight: "700", fontSize: 15 },
 
