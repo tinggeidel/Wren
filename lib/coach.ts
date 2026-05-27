@@ -995,34 +995,42 @@ export type CalibrationResult = {
   goal_direction: string;
   training_emphasis: string;
   motivation: string;
+  // Optional, qualitative rough body-composition descriptor / approximate range
+  // (e.g. "athletic, ~22–26%"). Visual BF estimation is unreliable so the prompt
+  // requires the model to frame it as a rough estimate, and to omit the field
+  // when the photos don't support it (no self-image / unclear). The numeric goal
+  // weight is still forbidden in the schema and the prompt.
+  body_fat_range?: string;
 };
 
-const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce three short, QUALITATIVE notes the Coach can use to understand the direction she's going — not to assess her body.
+const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce short, QUALITATIVE notes the Coach can use to understand the direction she's going.
 
 CALIBRATION SAFETY (overrides anything below it except the final SAFETY block):
-- Output is QUALITATIVE TEXT ONLY. The three fields are short strings: goal_direction, training_emphasis, motivation. Never include a body-fat percentage, a body-weight estimate or target, a goal weight, a calorie number, or any other number framed as a target. The tool schema does not accept numbers and you must not put numbers into the text fields either.
-- Do NOT assess the CURRENT photo to estimate her weight, body-fat, or measurements, and do not compare the two photos as "before/after." She picked her goal explicitly on a different screen — your output ENRICHES the Coach's understanding, it does NOT set targets.
+- Required fields are short strings: goal_direction, training_emphasis, motivation. Plus an OPTIONAL body_fat_range field — see below.
+- You MAY include a rough body-composition descriptor or approximate range in the optional body_fat_range field — e.g. "athletic, ~20–24%", "recomp candidate, ~25–28%", "average / starting fitness journey". Keep it SHORT and frame it clearly as a rough estimate. Visual body-fat estimation is unreliable, so it must always read as approximate, never a precise number (so "~22–26%", never "23.4%"). If the photos don't support an estimate — e.g. she only uploaded a goal photo, or the current photo isn't a clear self-image of her body — OMIT the field. Do not guess.
+- NEVER include a body-weight estimate, a goal weight, a calorie number, or any other number framed as a target to pursue. The tool schema does not accept those.
+- Do NOT compare the two photos as "before/after." She picked her goal explicitly on a different screen — your output ENRICHES the Coach's understanding, it does NOT set targets.
 - training_emphasis is a qualitative training direction only (e.g. "strength + hypertrophy", "more conditioning, light lifting", "steady mobility + walking"). Never a calorie number, never a macro number, never a weekly volume number.
-- If the goal image reflects an extreme, unhealthy, or visibly thinspo-style ideal (very low body-fat / extreme leanness presented as the goal), do NOT endorse it. Gently steer the three fields toward a STRENGTH, HEALTH, FEEL-BASED framing instead (e.g. "feeling strong and energized" rather than "getting that lean"). The motivation field must NEVER cheerlead extreme leanness, weight loss, or shrinking the body as the goal.
+- If the goal image reflects an extreme, unhealthy, or visibly thinspo-style ideal (very low body-fat / extreme leanness presented as the goal), do NOT endorse it. Gently steer the fields toward a STRENGTH, HEALTH, FEEL-BASED framing instead (e.g. "feeling strong and energized" rather than "getting that lean"). The motivation field must NEVER cheerlead extreme leanness, weight loss, or shrinking the body as the goal.
 - Supportive and warm, never shaming, never comparison-as-judgment. Do not write anything like "you need to look like this" or "you should be smaller." Frame motivation around what she is moving TOWARD (strength, energy, confidence, capability, how she wants to feel).
-- Keep all three fields short — roughly one sentence each, plain text, no markdown.
+- Keep all fields short — roughly one sentence each, plain text, no markdown.
 - If she shared only one photo, infer what you can from that one and leave the other side unweighted; don't make up what wasn't shown.
 
-Report by calling the report_calibration tool exactly once with the three fields.
+Report by calling the report_calibration tool exactly once with the fields.
 
 ${ED_SAFETY_RULES}`;
 
 const CALIBRATION_TOOL = {
   name: "report_calibration",
   description:
-    "Report the three short qualitative notes about the direction she's going. Text only — never numbers, never weight or body-fat estimates, never calorie or macro targets.",
+    "Report short qualitative notes about the direction she's going. Never a body-weight estimate, never a goal weight, never a calorie/macro number framed as a target.",
   input_schema: {
     type: "object",
     properties: {
       goal_direction: {
         type: "string",
         description:
-          "Short qualitative description of the direction she's going, e.g. 'leaner + stronger recomp', 'build visible muscle', 'general health and energy'. Never a body-fat % or weight number.",
+          "Short qualitative description of the direction she's going, e.g. 'leaner + stronger recomp', 'build visible muscle', 'general health and energy'. Never a body-weight number.",
       },
       training_emphasis: {
         type: "string",
@@ -1033,6 +1041,11 @@ const CALIBRATION_TOOL = {
         type: "string",
         description:
           "Short supportive note in the Coach's voice the Coach can echo back, framed around strength/health/how she wants to feel. Never cheerlead extreme leanness or weight loss.",
+      },
+      body_fat_range: {
+        type: "string",
+        description:
+          "OPTIONAL rough body-composition descriptor and/or approximate range, e.g. 'athletic, ~20–24%' or 'recomp candidate, ~25–28%' or 'average / starting fitness journey'. Short and clearly rough — visual estimates are unreliable, so always read as approximate (never 'X.X%'). OMIT this field if the photos don't support an estimate (no clear self-image, or she only shared a goal photo).",
       },
     },
     required: ["goal_direction", "training_emphasis", "motivation"],
@@ -1112,10 +1125,15 @@ export async function calibrateFromPhotos(
   const goal_direction = (raw.goal_direction ?? "").toString().trim();
   const training_emphasis = (raw.training_emphasis ?? "").toString().trim();
   const motivation = (raw.motivation ?? "").toString().trim();
+  // Optional qualitative BF descriptor — pass through only when the model
+  // actually wrote one. An empty string maps to undefined so the UI can branch
+  // cleanly on presence (no row rendered when absent).
+  const body_fat_range_raw = (raw.body_fat_range ?? "").toString().trim();
+  const body_fat_range = body_fat_range_raw || undefined;
   if (!goal_direction && !training_emphasis && !motivation) {
     throw new Error("No calibration produced.");
   }
-  return { goal_direction, training_emphasis, motivation };
+  return { goal_direction, training_emphasis, motivation, body_fat_range };
 }
 
 // --- Feature E: tailored weekly plan generation --------------------------------

@@ -187,6 +187,9 @@ const HEIGHT_DEFAULT_IN = 66; // 5'6"
 const WEIGHT_MIN_LB = 80;
 const WEIGHT_MAX_LB = 350;
 const WEIGHT_DEFAULT_LB = 150;
+// Goal weight uses the SAME bounds as current weight — optional, touched-gated.
+// Default shown to her isn't persisted unless she actually presses a stepper.
+const GOAL_WEIGHT_DEFAULT_LB = 140;
 
 // Format total inches as the ft'in" string parseHeightCm accepts (e.g. 5'6").
 function formatHeight(totalIn: number): string {
@@ -270,6 +273,13 @@ export default function OnboardingScreen({
   const [heightTouched, setHeightTouched] = useState(false);
   const [weightLb, setWeightLb] = useState(WEIGHT_DEFAULT_LB);
   const [weightTouched, setWeightTouched] = useState(false);
+  // Optional goal-weight stepper. Same touched-gating contract as height/weight:
+  // a skipped/untouched stepper leaves `goalWeight` blank on the Profile (no
+  // silent default), so the Coach can still ask later. Stored as "X lb" — the
+  // existing string format Settings already uses and the prompt context parser
+  // already reads.
+  const [goalWeightLb, setGoalWeightLb] = useState(GOAL_WEIGHT_DEFAULT_LB);
+  const [goalWeightTouched, setGoalWeightTouched] = useState(false);
 
   // Photo "calibration" step — strictly optional, use-then-discard.
   // We hold the local URI (for the in-step thumbnail) and the base64 (for the
@@ -366,6 +376,12 @@ export default function OnboardingScreen({
     setWeightLb(next);
     setWeightTouched(true);
     setWeight(`${next} lb`);
+  }
+  // Optional goal-weight handler. Touched-gating ensures an untouched stepper
+  // never silently writes a default into the Profile — finish() writes "" then.
+  function onGoalWeightChange(next: number) {
+    setGoalWeightLb(next);
+    setGoalWeightTouched(true);
   }
 
   // --- Photo step helpers ----------------------------------------------------
@@ -518,7 +534,9 @@ export default function OnboardingScreen({
 
   // Build the complete first Profile from the answers and persist it. We start
   // from the SAME empty base Settings would (every data map empty), then overlay
-  // the collected fields. NO new fields — this is the documented Profile shape.
+  // the collected fields. Profile is the documented shape plus two new optional
+  // fields (currentPhotoUri / goalPhotoUri) that hold the local photo URIs when
+  // she shared photos — base64 is still use-then-discard, only the URI persists.
   // Dietary chips + notes are also folded into dietaryRules (free text the Coach
   // reads in context) AND seeded into coachMemory below as durable facts.
   async function finish() {
@@ -568,10 +586,18 @@ export default function OnboardingScreen({
         age: ageForProfile,
         height: height.trim(),
         weight: weight.trim(),
-        goalWeight: "",
+        // Touched-gated: untouched stepper -> "" (no silent default), matching
+        // the height/weight robustness contract. Stored in the same "X lb"
+        // string format Settings collects and the prompt parser already reads.
+        goalWeight: goalWeightTouched ? `${goalWeightLb} lb` : "",
         activityLevel,
         calorieMode: "static", // safe default; she can switch to net in Settings
         coachMemory: [],
+        // Photo URIs only land on the Profile if she actually shared one; both
+        // remain undefined when the photo step was skipped. URIs are the
+        // expo-image-picker cache URIs; base64 is dropped in runCalibration.
+        currentPhotoUri: currentUri ?? undefined,
+        goalPhotoUri: goalUri ?? undefined,
       };
 
       // Seed durable Coach memory so the Coach knows her restrictions from message
@@ -744,6 +770,23 @@ export default function OnboardingScreen({
               {weightTouched ? `Weight ${weightLb} lb.` : "set weight — or skip both."}
             </Text>
 
+            {/* Optional goal-weight stepper. Same touched-gating + bounds as the
+                current-weight stepper. Skipping leaves goalWeight blank on the
+                Profile; she can always set or change it later in Settings. */}
+            <Text style={styles.label}>Goal weight (optional)</Text>
+            <Stepper
+              value={goalWeightLb}
+              min={WEIGHT_MIN_LB}
+              max={WEIGHT_MAX_LB}
+              display={`${goalWeightLb} lb`}
+              onChange={onGoalWeightChange}
+            />
+            <Text style={styles.hint}>
+              {goalWeightTouched
+                ? `Goal weight ${goalWeightLb} lb.`
+                : "If you have one in mind — totally optional, skip it if you'd rather not."}
+            </Text>
+
             <Text style={styles.label}>Activity level</Text>
             <View style={styles.chipWrap}>
               {ACTIVITIES.map((a) => (
@@ -794,6 +837,20 @@ export default function OnboardingScreen({
                 <View style={styles.confirmRow}>
                   <Text style={styles.confirmLabel}>Why</Text>
                   <Text style={styles.confirmValue}>{calibrationResult.motivation}</Text>
+                </View>
+              ) : null}
+              {/* Optional body-composition row. The model omits this when the
+                  photos don't support a real estimate; we mirror that — no row
+                  if the field is absent. Caveat line sits right under it because
+                  visual BF estimation is unreliable and we want her reading it
+                  as a rough impression, not a verdict. */}
+              {calibrationResult.body_fat_range ? (
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Composition (rough estimate)</Text>
+                  <Text style={styles.confirmValue}>{calibrationResult.body_fat_range}</Text>
+                  <Text style={styles.confirmCaveat}>
+                    Visual estimates are rough — take with a grain of salt.
+                  </Text>
                 </View>
               ) : null}
             </View>
@@ -892,8 +949,9 @@ export default function OnboardingScreen({
             )}
 
             <Text style={styles.hint}>
-              Photos aren't saved — your Coach reads them once to understand the direction, then
-              they're discarded. Skip the whole step anytime.
+              Photos are saved on your device so you can see your starting point and goal in
+              Settings — retake or delete them anytime. Your macros stay computed from your stats,
+              never from a photo. Skip the whole step anytime.
             </Text>
           </View>
         )}
@@ -1245,6 +1303,7 @@ const styles = StyleSheet.create({
   confirmRow: { gap: 4 },
   confirmLabel: { fontSize: 13, fontWeight: "700", color: ACCENT, letterSpacing: 0.3 },
   confirmValue: { fontSize: 15, color: "#1a1a1a", lineHeight: 21 },
+  confirmCaveat: { fontSize: 12, color: "#888", fontStyle: "italic", marginTop: 2, lineHeight: 16 },
   continueBtn: {
     marginTop: 18,
     backgroundColor: ACCENT,

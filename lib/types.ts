@@ -49,6 +49,14 @@ export type Profile = {
   // injuries, access, life events, her "why") the Coach saves via a tool and that
   // load into EVERY context — separate from, and cheaper than, the chat window.
   coachMemory?: CoachMemory[];
+  // Optional body photos picked during onboarding's photo calibration step and
+  // editable later in Settings. Stored as the local URI returned by
+  // expo-image-picker (which lands in the app cache). Base64 is STILL
+  // use-then-discard — only the URI persists. If cache eviction becomes an issue
+  // for a prototype these can be migrated to expo-file-system documentDir, but we
+  // deliberately don't pull that dep in now to keep the Expo Go install lean.
+  currentPhotoUri?: string;
+  goalPhotoUri?: string;
 };
 
 // One durable fact the Coach remembers about the user. See lib/memory.ts.

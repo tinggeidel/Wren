@@ -9,8 +9,10 @@ import {
   StyleSheet,
   Platform,
   Alert,
+  Image,
 } from "react-native";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
+import * as ImagePicker from "expo-image-picker";
 import {
   Profile,
   Goal,
@@ -80,6 +82,12 @@ export default function SettingsScreen({
   // and so deletes/out-of-band additions both show correctly. The parent re-passes
   // `initial` after each save, which re-renders the list below.
   const coachMemory: CoachMemory[] = initial?.coachMemory ?? [];
+  // Photo URIs are read from the live `initial` (not local state) so a retake
+  // or delete reflects immediately, and the wipe-guard pattern is preserved:
+  // every change goes through updateProfile so it composes on the LATEST
+  // profile and never clobbers sibling fields from a stale snapshot.
+  const currentPhotoUri = initial?.currentPhotoUri;
+  const goalPhotoUri = initial?.goalPhotoUri;
   const [showPicker, setShowPicker] = useState(false);
 
   // Overlay the form fields onto the LATEST profile `p` (passed in by
@@ -112,6 +120,11 @@ export default function SettingsScreen({
       weightLog: p.weightLog ?? [], // preserve weight log on save
       plan: p.plan, // preserve the tailored plan on save
       coachMemory: p.coachMemory ?? [], // preserve long-term Coach memory (don't clobber out-of-band adds)
+      // Photo URIs are managed by their own retake/delete handlers (which call
+      // updateProfile directly), so the form save just preserves whatever is on
+      // the latest profile — no clobber via stale snapshot.
+      currentPhotoUri: p.currentPhotoUri,
+      goalPhotoUri: p.goalPhotoUri,
     };
   }
 
@@ -144,6 +157,62 @@ export default function SettingsScreen({
   // and the list refreshes in place.
   async function handleForget(id: string) {
     await updateProfile((p) => removeMemory(p, id));
+  }
+
+  // --- Body photos ---------------------------------------------------------
+  // Retake = pick a new photo and store its URI. Delete = clear the URI.
+  // Both routes go through updateProfile so they compose on the LATEST profile
+  // (preserves the wipe-guard) and persist immediately, even if the user leaves
+  // without tapping Save. We deliberately do NOT re-run calibration on retake —
+  // the photo's role here is just on-device record; the original onboarding
+  // calibration already seeded Coach memory. Re-running would burn API spend
+  // every time she retakes, and the qualitative facts (now editable in the
+  // memory section above) are the durable signal.
+  async function pickAndStorePhoto(slot: "current" | "goal", source: "camera" | "library") {
+    try {
+      if (source === "camera") {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Camera access needed", "Allow camera access to add a photo.");
+          return;
+        }
+      }
+      const opts = { mediaTypes: "images" as const };
+      const res =
+        source === "camera"
+          ? await ImagePicker.launchCameraAsync(opts)
+          : await ImagePicker.launchImageLibraryAsync(opts);
+      if (res.canceled || !res.assets?.length) return;
+      const uri = res.assets[0].uri;
+      await updateProfile((p) =>
+        slot === "current" ? { ...p, currentPhotoUri: uri } : { ...p, goalPhotoUri: uri }
+      );
+    } catch (e: unknown) {
+      Alert.alert("Photo error", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function offerRetake(slot: "current" | "goal") {
+    Alert.alert(
+      slot === "current" ? "Replace your current photo" : "Replace your goal photo",
+      "Pick a new photo or skip.",
+      [
+        { text: "Take photo", onPress: () => void pickAndStorePhoto(slot, "camera") },
+        { text: "Choose from library", onPress: () => void pickAndStorePhoto(slot, "library") },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  }
+
+  async function handleDeletePhoto(slot: "current" | "goal") {
+    // Clear the URI. We don't try to delete the file from cache — Expo manages
+    // the cache and the URI is just a pointer; on next launch the asset may or
+    // may not still be there but that's fine because we no longer reference it.
+    await updateProfile((p) =>
+      slot === "current"
+        ? { ...p, currentPhotoUri: undefined }
+        : { ...p, goalPhotoUri: undefined }
+    );
   }
 
   // "Start over": destructive, irreversible wipe. Gate it behind a confirm so a
@@ -371,6 +440,61 @@ export default function SettingsScreen({
         </View>
       )}
 
+      {/* Body photos — the current + goal photos she shared during onboarding
+          (or hasn't yet). Two small thumbnail rows; each row has Retake + Delete
+          if a photo is set, or a single "Add" tap target when empty. All edits
+          flow through updateProfile so they persist immediately and compose on
+          the LATEST profile (wipe-guard preserved). Photos stay on this device. */}
+      <Text style={styles.section}>Body photos</Text>
+      <Text style={styles.hint}>
+        Optional. Saved on this device so you can see where you started and where you're going.
+        Your Coach already read them during onboarding — they don't change your macros.
+      </Text>
+
+      <Text style={styles.label}>Current</Text>
+      {currentPhotoUri ? (
+        <View style={styles.photoRow}>
+          <Image source={{ uri: currentPhotoUri }} style={styles.photoThumb} />
+          <View style={styles.photoActions}>
+            <TouchableOpacity style={styles.photoBtn} onPress={() => offerRetake("current")}>
+              <Text style={styles.photoBtnText}>Retake</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.photoBtn, styles.photoBtnDanger]}
+              onPress={() => void handleDeletePhoto("current")}
+            >
+              <Text style={styles.photoBtnDangerText}>Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
+        <TouchableOpacity style={styles.photoEmpty} onPress={() => offerRetake("current")}>
+          <Text style={styles.photoEmptyText}>No current photo · tap to add</Text>
+        </TouchableOpacity>
+      )}
+
+      <Text style={styles.label}>Goal</Text>
+      {goalPhotoUri ? (
+        <View style={styles.photoRow}>
+          <Image source={{ uri: goalPhotoUri }} style={styles.photoThumb} />
+          <View style={styles.photoActions}>
+            <TouchableOpacity style={styles.photoBtn} onPress={() => offerRetake("goal")}>
+              <Text style={styles.photoBtnText}>Retake</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.photoBtn, styles.photoBtnDanger]}
+              onPress={() => void handleDeletePhoto("goal")}
+            >
+              <Text style={styles.photoBtnDangerText}>Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
+        <TouchableOpacity style={styles.photoEmpty} onPress={() => offerRetake("goal")}>
+          <Text style={styles.photoEmptyText}>No goal photo · tap to add</Text>
+        </TouchableOpacity>
+      )}
+
       <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
         <Text style={styles.saveBtnText}>Save & go to Coach</Text>
       </TouchableOpacity>
@@ -453,6 +577,45 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   memoryDeleteText: { fontSize: 16, color: "#7c3aed", fontWeight: "700" },
+  // Body photos section: small thumbnail row when a photo is set; dashed
+  // tap-target card when empty. Same Flux palette as the rest of Settings.
+  photoRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    borderWidth: 1,
+    borderColor: "#e7e3f2",
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: "#faf9fd",
+    marginTop: 6,
+  },
+  photoThumb: { width: 80, height: 80, borderRadius: 8, backgroundColor: "#eee" },
+  photoActions: { flex: 1, gap: 8 },
+  photoBtn: {
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    alignItems: "center",
+    backgroundColor: "#fff",
+  },
+  photoBtnText: { color: "#333", fontSize: 14, fontWeight: "600" },
+  photoBtnDanger: { borderColor: "#dc2626" },
+  photoBtnDangerText: { color: "#dc2626", fontSize: 14, fontWeight: "600" },
+  photoEmpty: {
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: "#cfc8e0",
+    borderRadius: 12,
+    paddingVertical: 22,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#faf9fd",
+    marginTop: 6,
+  },
+  photoEmptyText: { color: "#7c3aed", fontWeight: "600", fontSize: 14 },
   switchRow: {
     flexDirection: "row",
     alignItems: "center",
