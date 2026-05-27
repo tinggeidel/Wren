@@ -466,6 +466,9 @@ export default function OnboardingScreen({
       if (result.goal_direction) facts.push(`goal direction: ${result.goal_direction}`);
       if (result.training_emphasis) facts.push(`training emphasis: ${result.training_emphasis}`);
       if (result.motivation) facts.push(`motivation: ${result.motivation}`);
+      // Optional — the model omits this when photos don't support an estimate.
+      // The string already comes back hedged (e.g. "~22–26%") per the prompt.
+      if (result.body_fat_range) facts.push(`body composition estimate: ${result.body_fat_range}`);
       return { result, facts };
     } catch {
       // Soft-skip: no facts seeded, no scary error to her face.
