@@ -822,6 +822,10 @@ export default function OnboardingScreen({
               max={HEIGHT_MAX_IN}
               display={formatHeight(heightIn)}
               onChange={onHeightChange}
+              // Touched-gated: the box reads as a "not set" preview until she
+              // actually presses −/+. finish() writes "" to the Profile until
+              // then (no silent BMR default).
+              dimmed={!heightTouched}
             />
 
             <Text style={styles.label}>Weight</Text>
@@ -831,6 +835,7 @@ export default function OnboardingScreen({
               max={WEIGHT_MAX_LB}
               display={`${weightLb} lb`}
               onChange={onWeightChange}
+              dimmed={!weightTouched}
             />
             <Text style={styles.hint}>
               {heightTouched ? `Height ${formatHeight(heightIn)}.` : "Tap or hold −/+ to set height"}
@@ -885,6 +890,11 @@ export default function OnboardingScreen({
               max={WAIST_MAX_IN}
               display={`${waistIn} in`}
               onChange={onWaistChange}
+              // Touched-gated. Stepper shows a dimmed "not set" preview until
+              // she presses −/+. Skipping the step leaves waistIn undefined on
+              // the Profile (and the Navy BF formula then returns null, no
+              // silent default into the calibration call).
+              dimmed={!waistTouched}
             />
             <Text style={styles.hint}>Measure the narrowest point, just above the navel.</Text>
 
@@ -895,6 +905,7 @@ export default function OnboardingScreen({
               max={NECK_MAX_IN}
               display={`${neckIn} in`}
               onChange={onNeckChange}
+              dimmed={!neckTouched}
             />
             <Text style={styles.hint}>Measure just below the larynx.</Text>
 
@@ -905,6 +916,7 @@ export default function OnboardingScreen({
               max={HIP_MAX_IN}
               display={`${hipIn} in`}
               onChange={onHipChange}
+              dimmed={!hipTouched}
             />
             <Text style={styles.hint}>Measure the widest point of your hips/glutes.</Text>
 
@@ -961,6 +973,11 @@ export default function OnboardingScreen({
               max={WEIGHT_MAX_LB}
               display={`${goalWeightLb} lb`}
               onChange={onGoalWeightChange}
+              // Touched-gated. Note: when calibration succeeds and the model
+              // proposed a goal weight, advanceFromPhotos already flips
+              // goalWeightTouched=true (so the box renders normally and the
+              // value will be persisted by finish()).
+              dimmed={!goalWeightTouched}
             />
             <Text style={styles.hint}>
               {goalWeightTouched
@@ -1054,6 +1071,10 @@ export default function OnboardingScreen({
               max={WEIGHT_MAX_LB}
               display={`${goalWeightLb} lb`}
               onChange={onGoalWeightChange}
+              // Touched-gated. Untouched stepper writes "" to goalWeight on
+              // the Profile (no silent default), so the dimmed preview keeps
+              // the visual contract honest.
+              dimmed={!goalWeightTouched}
             />
             <Text style={styles.hint}>
               {goalWeightTouched

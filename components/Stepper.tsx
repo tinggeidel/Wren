@@ -74,6 +74,14 @@ export function Stepper({
   step = 1,
   display,
   onChange,
+  // When true, the centered value box is rendered in a "placeholder" style
+  // (gray, italic) to visually signal that the displayed number is a default
+  // PREVIEW and is NOT yet committed to anywhere. Used by onboarding's
+  // touched-gated steppers (height/weight/goal-weight/waist/neck/hip) where
+  // the Profile field stays undefined until the user actually presses −/+.
+  // Default false preserves the original look for callers that always commit
+  // (e.g. WorkoutScreen's session-minutes stepper).
+  dimmed = false,
 }: {
   value: number;
   min: number;
@@ -82,6 +90,7 @@ export function Stepper({
   step?: number;
   display: string;
   onChange: (next: number) => void;
+  dimmed?: boolean;
 }) {
   const clamp = (n: number) => Math.max(min, Math.min(max, n));
   return (
@@ -91,8 +100,10 @@ export function Stepper({
         disabled={value <= min}
         onStep={() => onChange(clamp(value - step))}
       />
-      <View style={styles.stepperValueBox}>
-        <Text style={styles.stepperValue}>{display}</Text>
+      <View style={[styles.stepperValueBox, dimmed && styles.stepperValueBoxDimmed]}>
+        <Text style={[styles.stepperValue, dimmed && styles.stepperValueDimmed]}>
+          {dimmed ? `${display} · not set` : display}
+        </Text>
       </View>
       <StepButton
         label="+"
@@ -133,5 +144,15 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  // "Not set" preview state: subtler border + lighter fill so the box visually
+  // reads as a placeholder, not a committed value. Paired with stepperValueDimmed
+  // text style (gray + italic + lighter weight) so the contrast carries even
+  // when the dimmed box is glanced at quickly.
+  stepperValueBoxDimmed: {
+    borderColor: "#eee",
+    backgroundColor: "#f7f7f7",
+    borderStyle: "dashed",
+  },
   stepperValue: { fontSize: 22, fontWeight: "700", color: "#1a1a1a" },
+  stepperValueDimmed: { color: "#9a9aa3", fontWeight: "500", fontStyle: "italic", fontSize: 18 },
 });
