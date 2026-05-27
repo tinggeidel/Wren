@@ -73,7 +73,19 @@ export function computeBMR(p: Profile): number | null {
 // Deterministic daily targets from the profile. Returns null if we don't have
 // enough to compute (the Coach then asks for age/height/weight). Mifflin-St Jeor
 // BMR -> TDEE -> goal adjustment, with a hard BMR floor for safety.
+//
+// OVERRIDE: when profile.customTargets is set, we return those numbers
+// verbatim (no goal-multiplier math, no floor clamp). The user-facing floor
+// guard ALREADY ran at set-time in Settings (soft warning + explicit confirm),
+// so re-clamping here would silently rewrite her chosen numbers after she
+// confirmed. The Coach's set_targets tool enforces the BMR floor on its own
+// (per the design — the Coach refuses sub-floor even when Settings allows it).
 export function computeTargets(p: Profile): Targets | null {
+  if (p.customTargets) {
+    // Trust the user's saved override verbatim. She passed the floor warning at
+    // save-time; recomputing here would erase her choice.
+    return { ...p.customTargets };
+  }
   const kg = parseWeightKg(p.weight || "");
   const bmr = computeBMR(p);
   if (!kg || bmr == null) return null;
@@ -105,6 +117,44 @@ export function computeTargets(p: Profile): Targets | null {
 
   return {
     calories: Math.round(calories / 10) * 10,
+    protein: Math.round(protein / 5) * 5,
+    carbs: Math.max(0, Math.round(carbs / 5) * 5),
+    fat: Math.round(fat / 5) * 5,
+  };
+}
+
+// The deterministic BMR-floor for her macros: max(BMR, 1200). Returns null when
+// BMR can't be computed (missing age/height/weight). Used by:
+//   - Settings UI to show "Floor: NNNN kcal" and decide whether to fire the
+//     soft below-floor warning + confirm Alert.
+//   - The Coach's set_targets tool, which refuses to set calories below this.
+// Both surfaces must use the SAME number; this helper is the single source.
+export function targetsFloorCalories(p: Profile): number | null {
+  const bmr = computeBMR(p);
+  if (bmr == null) return null;
+  return Math.max(bmr, MIN_DAILY_CALORIES);
+}
+
+// Distribute a user-chosen calorie number across protein/carbs/fat using the
+// same goal-aware formula as computeTargets (protein per kg by goal, fat 27% of
+// calories, carbs the remainder, rounded the same way). Used by the Settings
+// "Auto-calc from calories" button and by set_targets when the Coach is only
+// given a calorie number. Returns null when weight is missing/unparseable
+// (protein-per-kg can't run without kg).
+//
+// Crucially, this does NOT apply the BMR floor — the caller decides whether to
+// pass a sub-floor calorie number. (Settings allows it after a confirm; the
+// Coach tool refuses it.)
+export function recomputeMacrosFromCalories(p: Profile, calories: number): Targets | null {
+  const kg = parseWeightKg(p.weight || "");
+  if (!kg) return null;
+  const safeCal = Math.max(0, calories);
+  const proteinPerKg = p.goal === "build_muscle" || p.goal === "tone_up" ? 2.0 : 1.8;
+  const protein = proteinPerKg * kg;
+  const fat = (safeCal * 0.27) / 9;
+  const carbs = (safeCal - protein * 4 - fat * 9) / 4;
+  return {
+    calories: Math.round(safeCal / 10) * 10,
     protein: Math.round(protein / 5) * 5,
     carbs: Math.max(0, Math.round(carbs / 5) * 5),
     fat: Math.round(fat / 5) * 5,

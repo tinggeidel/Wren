@@ -44,7 +44,9 @@ import {
   MoveDayArgs,
   RememberFactArgs,
   ForgetFactArgs,
+  SetTargetsArgs,
 } from "../lib/coach";
+import { computeTargets, targetsFloorCalories, recomputeMacrosFromCalories } from "../lib/targets";
 import { addMemory, removeMemory } from "../lib/memory";
 import { weekdayKey } from "../lib/plan";
 import { detectCrisisLanguage, CRISIS_RESOURCES_MESSAGE } from "../lib/safety";
@@ -497,6 +499,64 @@ export default function CoachScreen({
       if (result.kind === "many")
         return `I have a few saved facts that could match "${a.fact}", so I didn't remove anything. Ask her which one to forget.`;
       return `Done — I've forgotten "${result.text}".`;
+    }
+    if (name === "set_targets") {
+      const a = input as SetTargetsArgs;
+      // Floor = max(BMR, 1200). Single source of truth shared with Settings.
+      const floor = targetsFloorCalories(profileRef.current);
+      // REFUSAL: the Coach maintains its own ED_SAFETY_RULES stance even when
+      // Settings allows the user to override the floor herself. The user CAN
+      // override directly in Settings (after a soft warning + confirm); the
+      // Coach cannot. The message points her there if she really wants it.
+      if (typeof a.calories === "number" && floor != null && a.calories < floor) {
+        return `Refused: cannot set calories below the BMR floor of ${floor} kcal. The user can change it herself in Settings if she really wants.`;
+      }
+      // Build the new customTargets bundle. The override is all-four-numbers
+      // together (per the design — full granularity, not partial overlay over
+      // the formula), so any field she didn't specify is filled from her
+      // current effective targets. When ONLY calories was specified, use the
+      // formula to auto-distribute the three macros — this is what the prompt
+      // tells the model it can do.
+      const current = computeTargets(profileRef.current);
+      const calOnly =
+        typeof a.calories === "number" &&
+        typeof a.protein !== "number" &&
+        typeof a.carbs !== "number" &&
+        typeof a.fat !== "number";
+      let next: { calories: number; protein: number; carbs: number; fat: number } | null = null;
+      if (calOnly) {
+        const auto = recomputeMacrosFromCalories(profileRef.current, a.calories!);
+        if (!auto) {
+          return "Refused: cannot auto-distribute macros without her weight. Ask her to add it in Settings, or give specific macro numbers.";
+        }
+        next = auto;
+      } else {
+        // Need a baseline to fill any unspecified fields. Without weight/age
+        // on the profile and no full override already, we can't construct a
+        // sensible target from a partial spec.
+        if (!current && (typeof a.protein !== "number" || typeof a.carbs !== "number" || typeof a.fat !== "number" || typeof a.calories !== "number")) {
+          return "Refused: she hasn't set enough body info (age, height, weight) for me to fill in the rest. Ask her to add it in Settings, or specify all four numbers.";
+        }
+        next = {
+          calories: typeof a.calories === "number" ? Math.round(a.calories) : current!.calories,
+          protein: typeof a.protein === "number" ? Math.round(a.protein) : current!.protein,
+          carbs: typeof a.carbs === "number" ? Math.round(a.carbs) : current!.carbs,
+          fat: typeof a.fat === "number" ? Math.round(a.fat) : current!.fat,
+        };
+      }
+      // Second-pass refusal: if any merge produced sub-floor calories (e.g. she
+      // specified protein/carbs/fat but the existing calories field somehow
+      // ended up under, or the calorie-only auto-distribute rounded under),
+      // refuse here too. Defense in depth.
+      if (floor != null && next.calories < floor) {
+        return `Refused: cannot set calories below the BMR floor of ${floor} kcal. The user can change it herself in Settings if she really wants.`;
+      }
+      await updateProfile((p) => ({
+        ...p,
+        customTargets: next!,
+        customTargetsSetAt: toISODate(new Date()),
+      }));
+      return `Updated her targets to ${next.calories} kcal, ${next.protein}g protein, ${next.carbs}g carbs, ${next.fat}g fat. She can see and edit them in Settings.`;
     }
     return `Unknown tool ${name}.`;
   };

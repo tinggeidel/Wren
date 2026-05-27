@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   Platform,
   Alert,
   Image,
+  Modal,
 } from "react-native";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import * as ImagePicker from "expo-image-picker";
@@ -26,8 +27,13 @@ import {
   CoachMemory,
 } from "../lib/types";
 import { toISODate } from "../lib/cycle";
-import { computeTargets } from "../lib/targets";
+import {
+  computeTargets,
+  targetsFloorCalories,
+  recomputeMacrosFromCalories,
+} from "../lib/targets";
 import { removeMemory } from "../lib/memory";
+import { Stepper } from "../components/Stepper";
 
 const GOALS: Goal[] = ["lose_fat", "tone_up", "build_muscle", "feel_better", "maintain"];
 const TONES: Tone[] = ["hype", "bestie", "tough_love"];
@@ -139,13 +145,107 @@ export default function SettingsScreen({
       waistIn: p.waistIn,
       neckIn: p.neckIn,
       hipIn: p.hipIn,
+      // Macro override + when-set timestamp: written by the dedicated Macros
+      // editor below (which goes through updateProfile directly, like the
+      // photo handlers). The full-Save path just preserves whatever the
+      // latest profile holds — never blank from a stale snapshot.
+      customTargets: p.customTargets,
+      customTargetsSetAt: p.customTargetsSetAt,
     };
   }
 
   // Live-computed targets shown in this screen (the home for macros). Display
   // only — overlay the form onto the render-time `initial` (or {} on first run);
   // the authoritative save uses the latest profile via updateProfile.
-  const targets = computeTargets(buildProfileFromForm(initial ?? ({} as Profile)));
+  const formPreview = buildProfileFromForm(initial ?? ({} as Profile));
+  const targets = computeTargets(formPreview);
+  // Floor for the macros editor below: max(BMR, 1200). Null when she hasn't
+  // filled in enough body fields yet — in that case the editor still works
+  // and skips the warning (no floor to compare against).
+  const floorCal = targetsFloorCalories(formPreview);
+  const hasCustomTargets = !!initial?.customTargets;
+
+  // --- Macros editor sheet -------------------------------------------------
+  // Modal-state: live-edited calorie / macro values, NOT persisted until Save.
+  // Pre-populated with the current effective targets on open. Closing without
+  // tapping Save discards.
+  const [macrosOpen, setMacrosOpen] = useState(false);
+  const [editCal, setEditCal] = useState(0);
+  const [editProtein, setEditProtein] = useState(0);
+  const [editCarbs, setEditCarbs] = useState(0);
+  const [editFat, setEditFat] = useState(0);
+
+  // Re-seed the editor when it opens (or when current targets change while open
+  // would be unusual, but we still want it pre-filled with the right numbers).
+  useEffect(() => {
+    if (!macrosOpen) return;
+    const t = targets ?? { calories: 2000, protein: 130, carbs: 220, fat: 70 };
+    setEditCal(t.calories);
+    setEditProtein(t.protein);
+    setEditCarbs(t.carbs);
+    setEditFat(t.fat);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [macrosOpen]);
+
+  const editBelowFloor = floorCal != null && editCal < floorCal;
+  // Verbatim warning text — surfaced in the editor and (when she taps Save with
+  // a sub-floor calorie value) the confirm Alert. Kept in one const so both
+  // copies stay in sync. Soft + honest, non-alarmist, ED-safety-aware.
+  const subFloorWarningCopy = floorCal
+    ? `This is below your BMR (${floorCal} kcal). Sustained sub-BMR intake can affect energy, hormones, and recovery. You can save it if you want.`
+    : "";
+
+  // Recompute the three macro steppers from the current calorie stepper value,
+  // via the same goal-aware formula the auto-targets path uses (protein per kg,
+  // fat 27%, carbs the rest). No-op when weight is missing.
+  function autoCalcFromCalories() {
+    const out = recomputeMacrosFromCalories(formPreview, editCal);
+    if (!out) {
+      Alert.alert(
+        "Add your weight first",
+        "I need your weight to auto-calculate macros from a calorie target. Add it above and try again."
+      );
+      return;
+    }
+    setEditProtein(out.protein);
+    setEditCarbs(out.carbs);
+    setEditFat(out.fat);
+  }
+
+  async function persistCustomTargets() {
+    const next = {
+      calories: editCal,
+      protein: editProtein,
+      carbs: editCarbs,
+      fat: editFat,
+    };
+    await updateProfile((p) => ({
+      ...p,
+      customTargets: next,
+      customTargetsSetAt: toISODate(new Date()),
+    }));
+    setMacrosOpen(false);
+  }
+
+  function handleSaveMacros() {
+    if (editBelowFloor) {
+      Alert.alert("Below your BMR floor", subFloorWarningCopy + "\n\nSave it anyway?", [
+        { text: "Cancel", style: "cancel" },
+        { text: "Save it anyway", style: "destructive", onPress: () => void persistCustomTargets() },
+      ]);
+      return;
+    }
+    void persistCustomTargets();
+  }
+
+  async function handleResetMacros() {
+    await updateProfile((p) => ({
+      ...p,
+      customTargets: undefined,
+      customTargetsSetAt: undefined,
+    }));
+    setMacrosOpen(false);
+  }
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -352,16 +452,107 @@ export default function SettingsScreen({
         <View style={styles.targetsCard}>
           <Text style={styles.targetsTitle}>Your daily targets</Text>
           <Text style={styles.targetsNumbers}>
-            {targets.calories} kcal · {targets.protein}g protein · {targets.carbs}g carbs ·{" "}
-            {targets.fat}g fat
+            {targets.calories} kcal · {targets.protein}P / {targets.carbs}C / {targets.fat}F
           </Text>
-          <Text style={styles.targetsHint}>A starting point — tune it by results and how you feel.</Text>
+          <Text style={styles.targetsHint}>
+            {hasCustomTargets ? "Custom — set by you." : "Auto-computed from your goal."}
+          </Text>
+          {floorCal != null && (
+            <Text style={styles.targetsFloor}>Floor: {floorCal} kcal (your BMR)</Text>
+          )}
+          <TouchableOpacity style={styles.customizeBtn} onPress={() => setMacrosOpen(true)}>
+            <Text style={styles.customizeBtnText}>Customize</Text>
+          </TouchableOpacity>
         </View>
       ) : (
         <Text style={styles.targetsMissing}>
           Add age, height, and weight (with units, e.g. 5'6" and 140 lb) to see your daily targets.
         </Text>
       )}
+
+      {/* Macros editor — modal sheet. Four Steppers (calories + the three
+          macros), with an "Auto-calc from calories" helper, a soft sub-floor
+          warning that escalates to an Alert confirm on Save, and a Reset to
+          auto path. All writes go through updateProfile so they compose on the
+          LATEST profile (wipe-guard preserved). */}
+      <Modal
+        animationType="slide"
+        presentationStyle="pageSheet"
+        visible={macrosOpen}
+        onRequestClose={() => setMacrosOpen(false)}
+      >
+        <ScrollView
+          contentContainerStyle={styles.modalContainer}
+          keyboardShouldPersistTaps="handled"
+        >
+          <Text style={styles.title}>Customize macros</Text>
+          <Text style={styles.subtitle}>
+            Edit your daily targets. These override the auto-computed ones until you tap "Reset to
+            auto."
+          </Text>
+
+          <Text style={styles.label}>Calories (kcal)</Text>
+          <Stepper
+            value={editCal}
+            min={800}
+            max={5000}
+            step={10}
+            display={`${editCal} kcal`}
+            onChange={setEditCal}
+          />
+          {editBelowFloor && (
+            <Text style={styles.warnText}>{subFloorWarningCopy}</Text>
+          )}
+
+          <TouchableOpacity style={styles.autoCalcBtn} onPress={autoCalcFromCalories}>
+            <Text style={styles.autoCalcBtnText}>Auto-calc macros from calories</Text>
+          </TouchableOpacity>
+
+          <Text style={styles.label}>Protein (g)</Text>
+          <Stepper
+            value={editProtein}
+            min={0}
+            max={300}
+            step={5}
+            display={`${editProtein} g`}
+            onChange={setEditProtein}
+          />
+
+          <Text style={styles.label}>Carbs (g)</Text>
+          <Stepper
+            value={editCarbs}
+            min={0}
+            max={600}
+            step={5}
+            display={`${editCarbs} g`}
+            onChange={setEditCarbs}
+          />
+
+          <Text style={styles.label}>Fat (g)</Text>
+          <Stepper
+            value={editFat}
+            min={0}
+            max={200}
+            step={5}
+            display={`${editFat} g`}
+            onChange={setEditFat}
+          />
+
+          <TouchableOpacity style={styles.saveBtn} onPress={handleSaveMacros}>
+            <Text style={styles.saveBtnText}>Save macros</Text>
+          </TouchableOpacity>
+
+          {hasCustomTargets && (
+            <TouchableOpacity style={styles.resetMacrosBtn} onPress={() => void handleResetMacros()}>
+              <Text style={styles.resetMacrosBtnText}>Reset to auto</Text>
+            </TouchableOpacity>
+          )}
+
+          <TouchableOpacity style={styles.cancelBtn} onPress={() => setMacrosOpen(false)}>
+            <Text style={styles.cancelBtnText}>Cancel</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </Modal>
 
       <Text style={styles.section}>Calories & workouts</Text>
       <Text style={styles.label}>When you log a workout</Text>
@@ -598,7 +789,55 @@ const styles = StyleSheet.create({
   targetsTitle: { fontSize: 13, fontWeight: "700", color: "#7c3aed", textTransform: "uppercase", letterSpacing: 0.5 },
   targetsNumbers: { fontSize: 16, fontWeight: "600", color: "#1a1a1a", marginTop: 8, lineHeight: 24 },
   targetsHint: { fontSize: 13, color: "#666", marginTop: 8 },
+  targetsFloor: { fontSize: 12, color: "#888", marginTop: 4 },
   targetsMissing: { fontSize: 14, color: "#666", marginTop: 20, lineHeight: 20 },
+  customizeBtn: {
+    marginTop: 12,
+    alignSelf: "flex-start",
+    borderWidth: 1,
+    borderColor: "#7c3aed",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    backgroundColor: "#fff",
+  },
+  customizeBtnText: { color: "#7c3aed", fontWeight: "700", fontSize: 14 },
+  modalContainer: { padding: 20, paddingBottom: 60 },
+  // Soft sub-floor warning. Orange/red but not alarmist; honest copy.
+  warnText: {
+    fontSize: 13,
+    color: "#b45309",
+    marginTop: 8,
+    backgroundColor: "#fef3c7",
+    padding: 10,
+    borderRadius: 8,
+    lineHeight: 18,
+  },
+  autoCalcBtn: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: "#7c3aed",
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: "center",
+    backgroundColor: "#f0eef7",
+  },
+  autoCalcBtnText: { color: "#7c3aed", fontWeight: "700", fontSize: 14 },
+  resetMacrosBtn: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  resetMacrosBtnText: { color: "#333", fontWeight: "600", fontSize: 15 },
+  cancelBtn: {
+    marginTop: 8,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  cancelBtnText: { color: "#666", fontSize: 15 },
   hint: { fontSize: 13, color: "#666", marginTop: 8, lineHeight: 18 },
   memoryList: { marginTop: 12, gap: 8 },
   memoryRow: {

@@ -14,7 +14,7 @@ import {
   PlanDay,
 } from "./types";
 import { currentPhase, toISODate, observedCycleLength, nextPredictedPeriod } from "./cycle";
-import { computeTargets } from "./targets";
+import { computeTargets, targetsFloorCalories, recomputeMacrosFromCalories } from "./targets";
 import { consumedTotals, entriesFor, remaining, waterFor } from "./food";
 import { workoutsFor, workoutLabel, caloriesBurnedFor } from "./workouts";
 import { mondayOf, newId, targetForDate, planDayForDate } from "./plan";
@@ -142,6 +142,7 @@ MACROS, TARGETS, AND FOOD LOGGING:
 - Calories burned in workouts appear in the context for awareness. In "net" calorie mode they add to her daily budget — present that math plainly when it's relevant. Don't frame food as something to earn or burn off, and never push her below her BMR.
 - If the context says targets are not available and she asks about them, tell her to add her age, height, and weight in Settings. Do not collect those stats in chat.
 - Frame the targets as a strong starting point she will tune by results and how she feels. They already respect a safe floor (never below her BMR).
+- You can update her macro targets via the set_targets tool when she asks. Accepts any subset of calories/protein/carbs/fat — if she only gives a calorie number, the app will auto-distribute the macros via the existing formula. NEVER set calories below her BMR floor via the tool — refuse and explain she can change it herself in Settings if she really wants. (She can override the floor directly in Settings; you can't, by your own rules.)
 
 CYCLE AND DAILY CHECK-INS: speak about phases with confidence but stay honest that bodies vary. Use "many women find" and tie advice to how she actually feels and what she logs. Personalize over time. When today's check-in shows symptoms, energy, mood, or digestion, factor them into your food and training suggestions in a practical, food-first way (for example, many women find magnesium- and iron-rich foods or gentle movement help with cramps and fatigue; lighter, lower-sodium meals plus water can ease bloating; steady protein and complex carbs help with cravings and low energy). Keep it gentle and feel-based, never medical advice, never name specific supplements or doses.
 - LOGGING HER CYCLE: when she tells you her period started or ended, or how she physically feels (cramps, bloating, energy, mood, digestion), record it with the log_checkin tool so her Cycle tab and phase stay current. Map her words to the fields (e.g. "my period started, kind of heavy" -> flow heavy; "so crampy and tired" -> symptoms cramps and fatigue, energy low). Confirm warmly and briefly, then give a feel-based tip; do not interrogate her for the other fields.
@@ -235,8 +236,19 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
   // Target is cycled by today's plan intensity (rest/light/moderate/hard) if there's a plan.
   const t = targetForDate(profile, todayISO);
   const cycleNote = planDay ? ` (today is a ${planDay.intensity} day, so calories are cycled to match)` : "";
+  // Surface to the Coach when her targets are CUSTOM (set by her via Settings or
+  // the set_targets tool) and if they sit below her BMR floor — so the Coach
+  // doesn't second-guess the number it sees and can speak to it honestly when
+  // relevant. The floor itself is computed from her body fields, so it's
+  // independent of the override and stays meaningful as the safety reference.
+  const floor = targetsFloorCalories(profile);
+  const customNote = profile.customTargets
+    ? floor != null && profile.customTargets.calories < floor
+      ? ` (Note: her macro targets are custom — set by her — below the BMR floor of ${floor} kcal.)`
+      : " (Note: her macro targets are custom — set by her.)"
+    : "";
   const targetsLine = t
-    ? `Her daily GOAL targets${cycleNote} (present these EXACT numbers, never recompute): ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat`
+    ? `Her daily GOAL targets${cycleNote} (present these EXACT numbers, never recompute): ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat${customNote}`
     : "Daily targets: not enough data yet (need age, height, and weight) — if she asks, tell her to add them in Settings.";
   const plannedLine = planDay
     ? `Today's planned workout: ${planDay.kind === "rest" ? "Rest day" : planDay.title}${
@@ -395,6 +407,17 @@ export type LogWorkoutArgs = {
 export type MoveDayArgs = { from: Weekday; to: Weekday };
 export type RememberFactArgs = { fact: string };
 export type ForgetFactArgs = { fact: string };
+// Set her macro override via chat. Any subset is accepted; the runTool handler
+// fills missing fields from her current effective targets (or auto-distributes
+// from calories when only calories was given). Sub-floor calories are REFUSED
+// by the handler — the Coach maintains its ED_SAFETY_RULES stance even when
+// Settings allows the user to override the floor herself.
+export type SetTargetsArgs = {
+  calories?: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
+};
 export type AdjustDayArgs = {
   weekday?: Weekday; // which day to change; defaults to today
   kind?: "strength" | "activity" | "rest";
@@ -566,6 +589,20 @@ const FOOD_TOOLS = [
         },
       },
       required: ["from", "to"],
+    },
+  },
+  {
+    name: "set_targets",
+    description:
+      "Update her daily macro targets. Accepts any subset of calories/protein/carbs/fat. If she only specifies calories, you can auto-distribute the macros via the formula. NEVER set calories below her BMR floor — refuse and explain she can adjust in Settings if she really wants.",
+    input_schema: {
+      type: "object",
+      properties: {
+        calories: { type: "number", description: "Daily calorie target." },
+        protein: { type: "number", description: "Grams of protein per day." },
+        carbs: { type: "number", description: "Grams of carbohydrate per day." },
+        fat: { type: "number", description: "Grams of fat per day." },
+      },
     },
   },
   {

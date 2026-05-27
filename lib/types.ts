@@ -74,6 +74,17 @@ export type Profile = {
   currentFrontPhotoUri?: string;
   currentSidePhotoUri?: string;
   goalPhotoUri?: string;
+  // User-set macro override. When present, computeTargets returns these numbers
+  // verbatim and skips the goal-multiplier + BMR floor math. The override may
+  // sit BELOW the BMR floor — that's allowed only because Settings forces a
+  // soft-warning + explicit confirm before saving a sub-floor number, and the
+  // Coach's set_targets tool refuses sub-floor entirely (the Coach maintains
+  // its own ED_SAFETY_RULES stance even when the user already chose to
+  // override). All four numbers move together — see lib/targets.ts.
+  customTargets?: { calories: number; protein: number; carbs: number; fat: number };
+  // ISO date the override was set (optional, for Coach context "her targets
+  // are custom since YYYY-MM-DD" — not load-bearing, just signal).
+  customTargetsSetAt?: string;
 };
 
 // One durable fact the Coach remembers about the user. See lib/memory.ts.
