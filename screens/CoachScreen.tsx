@@ -8,11 +8,12 @@ import {
   StyleSheet,
   KeyboardAvoidingView,
   Platform,
-  ActivityIndicator,
   Alert,
   Image,
   Modal,
   Keyboard,
+  Animated,
+  Easing,
   NativeSyntheticEvent,
   NativeScrollEvent,
 } from "react-native";
@@ -87,6 +88,71 @@ function formatDayLabel(d: string): string {
     month: "short",
     day: "numeric",
   });
+}
+
+// Classic three-dot "Coach is typing" indicator — rendered inside an assistant
+// bubble so it reads as an in-progress message (iMessage/WhatsApp/Slack pattern).
+// Each dot rises slightly and pulses opacity; the three are staggered so they
+// cycle in sequence (dot 1 -> 2 -> 3 -> repeat), each cycle ~1.0s total.
+// Pure RN Animated (no dependency). Loops are stopped on unmount in the effect
+// cleanup so we don't leak animation drivers if the indicator unmounts mid-cycle.
+function TypingDots() {
+  // One progress value per dot, animated 0 -> 1 -> 0 on a 1s loop. We start the
+  // three loops with staggered delays (0, 200, 400ms) so the dots cycle in
+  // sequence instead of pulsing together. translateY and opacity are derived
+  // from the same value via interpolate to keep them in lockstep per dot.
+  const a = useRef(new Animated.Value(0)).current;
+  const b = useRef(new Animated.Value(0)).current;
+  const c = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const makeLoop = (v: Animated.Value) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(v, {
+            toValue: 1,
+            duration: 500,
+            easing: Easing.inOut(Easing.quad),
+            useNativeDriver: true,
+          }),
+          Animated.timing(v, {
+            toValue: 0,
+            duration: 500,
+            easing: Easing.inOut(Easing.quad),
+            useNativeDriver: true,
+          }),
+        ])
+      );
+    const loops = [makeLoop(a), makeLoop(b), makeLoop(c)];
+    // Stagger the starts so the dots cycle in sequence (1 -> 2 -> 3 -> repeat).
+    // setTimeout handles are tracked so we can clear any that haven't fired yet
+    // when this component unmounts mid-stagger (e.g. reply lands in <400ms).
+    const timeouts: ReturnType<typeof setTimeout>[] = [];
+    loops[0].start();
+    timeouts.push(setTimeout(() => loops[1].start(), 200));
+    timeouts.push(setTimeout(() => loops[2].start(), 400));
+    return () => {
+      timeouts.forEach(clearTimeout);
+      loops.forEach((l) => l.stop());
+    };
+  }, [a, b, c]);
+
+  const dotStyle = (v: Animated.Value) => ({
+    opacity: v.interpolate({ inputRange: [0, 1], outputRange: [0.4, 1] }),
+    transform: [
+      { translateY: v.interpolate({ inputRange: [0, 1], outputRange: [0, -3] }) },
+    ],
+  });
+
+  return (
+    <View style={[styles.bubble, styles.coachBubble, styles.typingBubble]}>
+      <View style={styles.typingRow}>
+        <Animated.View style={[styles.typingDot, dotStyle(a)]} />
+        <Animated.View style={[styles.typingDot, dotStyle(b)]} />
+        <Animated.View style={[styles.typingDot, dotStyle(c)]} />
+      </View>
+    </View>
+  );
 }
 
 export default function CoachScreen({
@@ -878,12 +944,7 @@ export default function CoachScreen({
           setAtBottom(true);
         }}
       >
-        {booting && (
-          <View style={styles.booting}>
-            <ActivityIndicator />
-            <Text style={styles.bootingText}>Setting up your day…</Text>
-          </View>
-        )}
+        {booting && <TypingDots />}
         {!booting && messages.length === 0 && (
           <Text style={styles.empty}>
             Hi{profile.name ? ` ${profile.name}` : ""}! Tell me what you ate, ask what to make for
@@ -911,7 +972,7 @@ export default function CoachScreen({
             </Fragment>
           );
         })}
-        {sending && <ActivityIndicator style={styles.spinner} />}
+        {sending && <TypingDots />}
       </ScrollView>
 
       {!inputFocused && atBottom && (
@@ -980,8 +1041,6 @@ const styles = StyleSheet.create({
   headerLink: { fontSize: 15, color: "#7c3aed", fontWeight: "600" },
   messages: { padding: 16, paddingBottom: 8 },
   empty: { color: "#666", fontSize: 15, lineHeight: 22, marginTop: 8 },
-  booting: { paddingVertical: 28, alignItems: "center", gap: 10 },
-  bootingText: { color: "#666", fontSize: 14 },
   divider: {
     alignSelf: "center",
     color: "#999",
@@ -989,7 +1048,12 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     marginVertical: 12,
   },
-  spinner: { marginTop: 10, alignSelf: "flex-start" },
+  // Typing-dots indicator: a compact assistant bubble (matches coachBubble bg/
+  // radius/alignment) with three dots in a row. Slightly tighter vertical
+  // padding than a real message bubble so it reads as "composing", not a reply.
+  typingBubble: { paddingVertical: 12, paddingHorizontal: 14 },
+  typingRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  typingDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: "#999" },
   bubbleImage: { width: 200, height: 200, borderRadius: 12, marginBottom: 6 },
   photoBtn: {
     width: 42,
