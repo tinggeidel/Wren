@@ -168,22 +168,25 @@ export default function SettingsScreen({
   // --- Macros editor sheet -------------------------------------------------
   // Modal-state: live-edited calorie / macro values, NOT persisted until Save.
   // Pre-populated with the current effective targets on open. Closing without
-  // tapping Save discards.
+  // tapping Save discards. Fiber sits alongside protein/carbs/fat as a tracked
+  // macro; no ED-safety floor on fiber — only the calorie BMR floor matters.
   const [macrosOpen, setMacrosOpen] = useState(false);
   const [editCal, setEditCal] = useState(0);
   const [editProtein, setEditProtein] = useState(0);
   const [editCarbs, setEditCarbs] = useState(0);
   const [editFat, setEditFat] = useState(0);
+  const [editFiber, setEditFiber] = useState(0);
 
   // Re-seed the editor when it opens (or when current targets change while open
   // would be unusual, but we still want it pre-filled with the right numbers).
   useEffect(() => {
     if (!macrosOpen) return;
-    const t = targets ?? { calories: 2000, protein: 130, carbs: 220, fat: 70 };
+    const t = targets ?? { calories: 2000, protein: 130, carbs: 220, fat: 70, fiber: 28 };
     setEditCal(t.calories);
     setEditProtein(t.protein);
     setEditCarbs(t.carbs);
     setEditFat(t.fat);
+    setEditFiber(t.fiber);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [macrosOpen]);
 
@@ -210,6 +213,7 @@ export default function SettingsScreen({
     setEditProtein(out.protein);
     setEditCarbs(out.carbs);
     setEditFat(out.fat);
+    setEditFiber(out.fiber);
   }
 
   async function persistCustomTargets() {
@@ -218,6 +222,7 @@ export default function SettingsScreen({
       protein: editProtein,
       carbs: editCarbs,
       fat: editFat,
+      fiber: editFiber,
     };
     await updateProfile((p) => ({
       ...p,
@@ -452,7 +457,7 @@ export default function SettingsScreen({
         <View style={styles.targetsCard}>
           <Text style={styles.targetsTitle}>Your daily targets</Text>
           <Text style={styles.targetsNumbers}>
-            {targets.calories} kcal · {targets.protein}P / {targets.carbs}C / {targets.fat}F
+            {targets.calories} kcal · {targets.protein}P / {targets.carbs}C / {targets.fat}F · {targets.fiber}g fiber
           </Text>
           <Text style={styles.targetsHint}>
             {hasCustomTargets ? "Custom — set by you." : "Auto-computed from your goal."}
@@ -536,6 +541,16 @@ export default function SettingsScreen({
             step={5}
             display={`${editFat} g`}
             onChange={setEditFat}
+          />
+
+          <Text style={styles.label}>Fiber (g)</Text>
+          <Stepper
+            value={editFiber}
+            min={0}
+            max={100}
+            step={1}
+            display={`${editFiber} g`}
+            onChange={setEditFiber}
           />
 
           <TouchableOpacity style={styles.saveBtn} onPress={handleSaveMacros}>

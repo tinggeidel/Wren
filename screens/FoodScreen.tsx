@@ -61,6 +61,10 @@ type Draft = {
   protein: string;
   carbs: string;
   fat: string;
+  // Fiber as a string so an EMPTY value can be distinguished from "0" — empty
+  // = not provided (entry persists without fiber, doesn't contribute to the
+  // day's sum); "0" = explicitly zero. Mirrors the manual/edit handlers.
+  fiber: string;
 };
 
 const ACCENT = "#7c3aed";
@@ -150,6 +154,7 @@ export default function FoodScreen({
   const [mP, setMP] = useState("");
   const [mC, setMC] = useState("");
   const [mF, setMF] = useState("");
+  const [mFi, setMFi] = useState(""); // fiber
 
   // Edit existing entry
   const [editEntry, setEditEntry] = useState<FoodEntry | null>(null);
@@ -159,6 +164,7 @@ export default function FoodScreen({
   const [eP, setEP] = useState("");
   const [eC, setEC] = useState("");
   const [eF, setEF] = useState("");
+  const [eFi, setEFi] = useState(""); // fiber (empty string = leave undefined on save)
 
   // All persistence goes through the shared updater so the transform applies to
   // the LATEST profile (never the render-time `profile` prop). `persist` here is
@@ -316,6 +322,9 @@ export default function FoodScreen({
             protein: String(Math.round(i.protein || 0)),
             carbs: String(Math.round(i.carbs || 0)),
             fat: String(Math.round(i.fat || 0)),
+            // Empty string when the model didn't return fiber — leaves the
+            // edit field blank rather than implying "this meal has 0 fiber".
+            fiber: typeof i.fiber === "number" ? String(Math.round(i.fiber)) : "",
           }))
         );
         setPhotoReview(true);
@@ -397,6 +406,9 @@ export default function FoodScreen({
         protein: String(m.protein),
         carbs: String(m.carbs),
         fat: String(m.fat),
+        // OFF rows always carry a fiber number (0 when missing on the source);
+        // surface it so the saved-meal template keeps it.
+        fiber: String(m.fiber),
       },
     ]);
     setBQuery("");
@@ -413,13 +425,14 @@ export default function FoodScreen({
         protein: String(s.protein),
         carbs: String(s.carbs),
         fat: String(s.fat),
+        fiber: typeof s.fiber === "number" ? String(s.fiber) : "",
       },
     ]);
   }
   function addBlankMealItem() {
     setMealItems((items) => [
       ...items,
-      { id: newId(), name: "", quantity: "", calories: "", protein: "", carbs: "", fat: "" },
+      { id: newId(), name: "", quantity: "", calories: "", protein: "", carbs: "", fat: "", fiber: "" },
     ]);
   }
   function updateMealItem(id: string, field: keyof Draft, val: string) {
@@ -435,16 +448,19 @@ export default function FoodScreen({
     const newMeal: SavedMeal = {
       id: newId(),
       name,
-      items: items.map((d) =>
-        toSavedFood({
+      items: items.map((d) => {
+        const fiberStr = d.fiber.trim();
+        const fiberVal = fiberStr === "" ? undefined : parseFloat(fiberStr) || 0;
+        return toSavedFood({
           name: d.name.trim(),
           quantityLabel: d.quantity.trim() || undefined,
           calories: parseFloat(d.calories) || 0,
           protein: parseFloat(d.protein) || 0,
           carbs: parseFloat(d.carbs) || 0,
           fat: parseFloat(d.fat) || 0,
-        })
-      ),
+          fiber: fiberVal,
+        });
+      }),
     };
     await persist((p) => saveMeal(p, newMeal));
     setMealBuilderOpen(false);
@@ -461,6 +477,8 @@ export default function FoodScreen({
     await persist((p) => {
       let next = p;
       for (const d of drafts) {
+        const fiberStr = d.fiber.trim();
+        const fiberVal = fiberStr === "" ? undefined : parseFloat(fiberStr) || 0;
         const entry = makeEntry(
           {
             name: d.name.trim() || "Food",
@@ -469,6 +487,7 @@ export default function FoodScreen({
             protein: parseFloat(d.protein) || 0,
             carbs: parseFloat(d.carbs) || 0,
             fat: parseFloat(d.fat) || 0,
+            fiber: fiberVal,
             date: selDate,
           },
           "photo"
@@ -501,6 +520,9 @@ export default function FoodScreen({
         protein: m.protein,
         carbs: m.carbs,
         fat: m.fat,
+        // OFF carries fiber when available; scaleHit fills 0 when missing. Pass
+        // through so the entry's fiber survives any future re-scale path.
+        fiber: m.fiber,
         per100g: pendingHit.per100g ?? undefined,
         barcode: pendingHit.barcode,
         date: selDate,
@@ -521,6 +543,11 @@ export default function FoodScreen({
     const name = mName.trim();
     const cal = parseFloat(mCal) || 0;
     if (!name || cal <= 0) return;
+    // Treat a blank fiber input as "not provided" rather than 0 — consumedTotals
+    // ignores `undefined` (back-compat with older entries), and persisting 0
+    // would dishonestly assert the food has no fiber.
+    const fiberStr = mFi.trim();
+    const fiberVal = fiberStr === "" ? undefined : parseFloat(fiberStr) || 0;
     const entry = makeEntry(
       {
         name,
@@ -529,6 +556,7 @@ export default function FoodScreen({
         protein: parseFloat(mP) || 0,
         carbs: parseFloat(mC) || 0,
         fat: parseFloat(mF) || 0,
+        fiber: fiberVal,
         date: selDate,
       },
       "manual"
@@ -544,6 +572,7 @@ export default function FoodScreen({
     setMP("");
     setMC("");
     setMF("");
+    setMFi("");
     setMSave(false);
     setAddOpen(false);
   }
@@ -558,6 +587,7 @@ export default function FoodScreen({
         protein: e.protein,
         carbs: e.carbs,
         fat: e.fat,
+        fiber: e.fiber,
         per100g: e.per100g,
         barcode: e.barcode,
         date: selDate,
@@ -576,10 +606,15 @@ export default function FoodScreen({
     setEP(String(e.protein));
     setEC(String(e.carbs));
     setEF(String(e.fat));
+    // Empty string when the entry pre-dates fiber tracking, so the input shows
+    // blank rather than "0" (and Save won't fabricate a 0 fiber value).
+    setEFi(typeof e.fiber === "number" ? String(e.fiber) : "");
   }
 
   async function saveEdit() {
     if (!editEntry) return;
+    const fiberStr = eFi.trim();
+    const fiberVal = fiberStr === "" ? undefined : Math.round(parseFloat(fiberStr) || 0);
     const edited: FoodEntry = {
       ...editEntry,
       name: eName.trim() || editEntry.name,
@@ -588,6 +623,7 @@ export default function FoodScreen({
       protein: Math.round(parseFloat(eP) || 0),
       carbs: Math.round(parseFloat(eC) || 0),
       fat: Math.round(parseFloat(eF) || 0),
+      fiber: fiberVal,
     };
     await persist((p) => updateEntry(p, edited));
     setEditEntry(null);
@@ -602,6 +638,8 @@ export default function FoodScreen({
 
   async function saveEditAsFood() {
     if (!editEntry) return;
+    const fiberStr = eFi.trim();
+    const fiberVal = fiberStr === "" ? undefined : parseFloat(fiberStr) || 0;
     const saved = toSavedFood({
       name: eName.trim() || editEntry.name,
       brand: editEntry.brand,
@@ -609,6 +647,7 @@ export default function FoodScreen({
       protein: parseFloat(eP) || 0,
       carbs: parseFloat(eC) || 0,
       fat: parseFloat(eF) || 0,
+      fiber: fiberVal,
       quantityLabel: eQty.trim() || undefined,
       per100g: editEntry.per100g,
       barcode: editEntry.barcode,
@@ -708,6 +747,7 @@ export default function FoodScreen({
             <MacroStat label="Protein" value={consumed.protein} target={target?.protein} />
             <MacroStat label="Carbs" value={consumed.carbs} target={target?.carbs} />
             <MacroStat label="Fat" value={consumed.fat} target={target?.fat} />
+            <MacroStat label="Fiber" value={consumed.fiber} target={target?.fiber} />
           </View>
           {!target && (
             <Text style={styles.noTarget}>
@@ -1052,6 +1092,7 @@ export default function FoodScreen({
                         <MacroInput label="Protein" value={mP} onChange={setMP} />
                         <MacroInput label="Carbs" value={mC} onChange={setMC} />
                         <MacroInput label="Fat" value={mF} onChange={setMF} />
+                        <MacroInput label="Fiber" value={mFi} onChange={setMFi} />
                       </View>
                       <TouchableOpacity
                         style={[styles.favBtn, mSave && styles.favBtnOn]}
@@ -1112,6 +1153,7 @@ export default function FoodScreen({
                 <MacroInput label="Protein" value={eP} onChange={setEP} />
                 <MacroInput label="Carbs" value={eC} onChange={setEC} />
                 <MacroInput label="Fat" value={eF} onChange={setEF} />
+                <MacroInput label="Fiber" value={eFi} onChange={setEFi} />
               </View>
               <TouchableOpacity style={styles.saveBtn} onPress={saveEdit}>
                 <Text style={styles.saveBtnText}>Save</Text>
@@ -1198,6 +1240,11 @@ export default function FoodScreen({
                       value={d.fat}
                       onChange={(t) => updateDraft(d.id, "fat", t)}
                     />
+                    <MacroInput
+                      label="Fiber"
+                      value={d.fiber}
+                      onChange={(t) => updateDraft(d.id, "fiber", t)}
+                    />
                   </View>
                 </View>
               ))}
@@ -1282,6 +1329,7 @@ export default function FoodScreen({
                     <MacroInput label="Protein" value={d.protein} onChange={(t) => updateMealItem(d.id, "protein", t)} />
                     <MacroInput label="Carbs" value={d.carbs} onChange={(t) => updateMealItem(d.id, "carbs", t)} />
                     <MacroInput label="Fat" value={d.fat} onChange={(t) => updateMealItem(d.id, "fat", t)} />
+                    <MacroInput label="Fiber" value={d.fiber} onChange={(t) => updateMealItem(d.id, "fiber", t)} />
                   </View>
                 </View>
               ))}

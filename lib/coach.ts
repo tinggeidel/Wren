@@ -132,7 +132,7 @@ VOICE: text like a real person, not a bot.
 - Match the coaching tone given in the context (it is the user's choice). Tone changes how you sound, never whether you are honest, and never the numbers.
 
 MACROS, TARGETS, AND FOOD LOGGING:
-- Her daily targets are already calculated for you and given in the context (calories and protein, carbs, fat). Present those EXACT numbers. Never invent, recompute, or change them, and never let your tone change them. The targets are her GOAL for the day.
+- Her daily targets are already calculated for you and given in the context (calories and protein, carbs, fat, fiber). Present those EXACT numbers. Never invent, recompute, or change them, and never let your tone change them. The targets are her GOAL for the day. Fiber is a tracked macro alongside protein/carbs/fat — present it the same way (a daily-habit number, not a hard cutoff).
 - Flux now logs her food. The context gives you her REAL logged food for today, the consumed totals, and what is remaining versus her goal. These totals are summed in code from her actual entries, so they are trustworthy. You MAY tell her how much she has eaten and how much she has left — but ONLY using the consumed and remaining numbers given in the context. Never invent a tally, never estimate consumed or remaining numbers beyond what the context provides. If nothing is logged, the context will say so; then say plainly she has not logged anything yet.
 - When she tells you she ate or drank something that is not already in today's logged list, LOG IT FOR HER by calling the log_food tool (one call per food) or log_water tool. If she did not give exact numbers, estimate the macros from typical values for that food and portion — estimates are approximate, so say so briefly and naturally (for example "logged that, roughly 280 calories, tweak it if you weighed it"). Do not claim something is logged unless you actually called the tool, and do not double-log an item that is already in today's list.
 - PHOTOS: she can send two kinds.
@@ -248,7 +248,7 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
       : " (Note: her macro targets are custom — set by her.)"
     : "";
   const targetsLine = t
-    ? `Her daily GOAL targets${cycleNote} (present these EXACT numbers, never recompute): ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat${customNote}`
+    ? `Her daily GOAL targets${cycleNote} (present these EXACT numbers, never recompute): ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat, ${t.fiber}g fiber${customNote}`
     : "Daily targets: not enough data yet (need age, height, and weight) — if she asks, tell her to add them in Settings.";
   const plannedLine = planDay
     ? `Today's planned workout: ${planDay.kind === "rest" ? "Rest day" : planDay.title}${
@@ -261,14 +261,17 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
   const consumed = consumedTotals(profile, todayISO);
   const foodLines = entries.length
     ? entries
-        .map(
-          (e) =>
-            `- ${e.name}${e.quantityLabel ? ` (${e.quantityLabel})` : ""} — ${e.calories} kcal, ${e.protein}g P, ${e.carbs}g C, ${e.fat}g F`
-        )
+        .map((e) => {
+          // Only surface fiber on the per-entry line when the entry actually
+          // recorded one — older entries (pre-fiber) shouldn't render "0g fiber"
+          // and look like the user logged a fiber-free food deliberately.
+          const fiberPart = typeof e.fiber === "number" ? `, ${e.fiber}g fiber` : "";
+          return `- ${e.name}${e.quantityLabel ? ` (${e.quantityLabel})` : ""} — ${e.calories} kcal, ${e.protein}g P, ${e.carbs}g C, ${e.fat}g F${fiberPart}`;
+        })
         .join("\n")
     : "(nothing logged yet today)";
   const consumedLine = entries.length
-    ? `Consumed so far today (summed in code, exact — do not change): ${consumed.calories} kcal, ${consumed.protein}g protein, ${consumed.carbs}g carbs, ${consumed.fat}g fat.`
+    ? `Consumed so far today (summed in code, exact — do not change): ${consumed.calories} kcal, ${consumed.protein}g protein, ${consumed.carbs}g carbs, ${consumed.fat}g fat, ${consumed.fiber}g fiber.`
     : "She has logged no food yet today.";
   const burned = caloriesBurnedFor(profile, todayISO);
   const mode = profile.calorieMode ?? "static";
@@ -278,7 +281,7 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
     const calLeft = budgetCal - consumed.calories;
     const r = remaining(consumed, t);
     const budgetNote = mode === "net" && burned ? ` (goal ${t.calories} + ${burned} burned)` : "";
-    remainingLine = `Remaining today: ${calLeft} kcal${budgetNote}, ${r.protein}g protein, ${r.carbs}g carbs, ${r.fat}g fat.`;
+    remainingLine = `Remaining today: ${calLeft} kcal${budgetNote}, ${r.protein}g protein, ${r.carbs}g carbs, ${r.fat}g fat, ${r.fiber}g fiber.`;
   }
   const waterLine = `Water today: ${waterFor(profile, todayISO)} of ${WATER_GOAL_CUPS} cups.`;
 
@@ -381,6 +384,7 @@ export type LogFoodArgs = {
   protein?: number;
   carbs?: number;
   fat?: number;
+  fiber?: number;
 };
 export type LogWaterArgs = { cups: number };
 export type LogCheckinArgs = {
@@ -417,6 +421,7 @@ export type SetTargetsArgs = {
   protein?: number;
   carbs?: number;
   fat?: number;
+  fiber?: number;
 };
 export type AdjustDayArgs = {
   weekday?: Weekday; // which day to change; defaults to today
@@ -447,6 +452,7 @@ const FOOD_TOOLS = [
         protein: { type: "number", description: "Grams of protein." },
         carbs: { type: "number", description: "Grams of carbohydrate." },
         fat: { type: "number", description: "Grams of fat." },
+        fiber: { type: "number", description: "Grams of dietary fiber. Omit if you don't have a sensible estimate." },
       },
       required: ["name", "calories"],
     },
@@ -594,7 +600,7 @@ const FOOD_TOOLS = [
   {
     name: "set_targets",
     description:
-      "Update her daily macro targets. Accepts any subset of calories/protein/carbs/fat. If she only specifies calories, you can auto-distribute the macros via the formula. NEVER set calories below her BMR floor — refuse and explain she can adjust in Settings if she really wants.",
+      "Update her daily macro targets. Accepts any subset of calories/protein/carbs/fat/fiber. If she only specifies calories, you can auto-distribute the macros (including fiber) via the formula. NEVER set calories below her BMR floor — refuse and explain she can adjust in Settings if she really wants.",
     input_schema: {
       type: "object",
       properties: {
@@ -602,6 +608,7 @@ const FOOD_TOOLS = [
         protein: { type: "number", description: "Grams of protein per day." },
         carbs: { type: "number", description: "Grams of carbohydrate per day." },
         fat: { type: "number", description: "Grams of fat per day." },
+        fiber: { type: "number", description: "Grams of dietary fiber per day." },
       },
     },
   },
@@ -932,6 +939,7 @@ export type EstimatedFood = {
   protein?: number;
   carbs?: number;
   fat?: number;
+  fiber?: number;
 };
 
 const PHOTO_SYSTEM = `You are a nutrition vision assistant for the Flux app. Look at the photo and report the food.
@@ -958,6 +966,7 @@ const REPORT_TOOL = {
             protein: { type: "number", description: "grams" },
             carbs: { type: "number", description: "grams" },
             fat: { type: "number", description: "grams" },
+            fiber: { type: "number", description: "grams of dietary fiber; omit if not on the label or hard to estimate" },
           },
           required: ["name", "calories"],
         },

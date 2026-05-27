@@ -15,7 +15,7 @@ import {
 } from "./types";
 import { toISODate } from "./cycle";
 
-export const ZERO: Macros = { calories: 0, protein: 0, carbs: 0, fat: 0 };
+export const ZERO: Macros = { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
 
 // --- Local store helpers (all pure: return a new Profile) ---------------------
 
@@ -24,6 +24,9 @@ export function entriesFor(p: Profile, date: string): FoodEntry[] {
 }
 
 // A day's consumed totals — a plain deterministic sum, never an estimate.
+// Entries logged BEFORE fiber tracking existed don't have e.fiber set; the
+// `?? 0` rule treats them as zero contributors so older days don't suddenly
+// show stale numbers.
 export function consumedTotals(p: Profile, date: string): Macros {
   return entriesFor(p, date).reduce(
     (acc, e) => ({
@@ -31,6 +34,7 @@ export function consumedTotals(p: Profile, date: string): Macros {
       protein: acc.protein + (e.protein || 0),
       carbs: acc.carbs + (e.carbs || 0),
       fat: acc.fat + (e.fat || 0),
+      fiber: acc.fiber + (e.fiber ?? 0),
     }),
     { ...ZERO }
   );
@@ -42,6 +46,7 @@ export function remaining(consumed: Macros, target: Macros): Macros {
     protein: Math.round(target.protein - consumed.protein),
     carbs: Math.round(target.carbs - consumed.carbs),
     fat: Math.round(target.fat - consumed.fat),
+    fiber: Math.round(target.fiber - consumed.fiber),
   };
 }
 
@@ -69,12 +74,21 @@ export function newId(): string {
 }
 
 // Build a complete FoodEntry from a partial (fills id/date/source/createdAt).
+// Fiber is optional — when omitted, the entry persists without a fiber field
+// (which the back-compat `?? 0` in consumedTotals handles) rather than
+// pretending the food has zero fiber. Sources that DO supply fiber (OFF
+// search/barcode, the Coach's log_food, manual entry once the UI exposes it)
+// will pass a number through.
 export function makeEntry(
-  partial: Omit<FoodEntry, "id" | "createdAt" | "date" | "source" | "protein" | "carbs" | "fat"> & {
+  partial: Omit<
+    FoodEntry,
+    "id" | "createdAt" | "date" | "source" | "protein" | "carbs" | "fat" | "fiber"
+  > & {
     date?: string;
     protein?: number;
     carbs?: number;
     fat?: number;
+    fiber?: number;
   },
   source: FoodSource
 ): FoodEntry {
@@ -89,6 +103,7 @@ export function makeEntry(
     protein: Math.round(partial.protein || 0),
     carbs: Math.round(partial.carbs || 0),
     fat: Math.round(partial.fat || 0),
+    fiber: typeof partial.fiber === "number" ? Math.round(partial.fiber) : undefined,
   };
 }
 
@@ -115,6 +130,10 @@ export function removeEntry(p: Profile, date: string, id: string): Profile {
 // --- Saved foods & meals (Feature: My Meals / Saved foods) --------------------
 
 // A reusable SavedFood template from anything with macros (entry, hit, draft).
+// Fiber is optional throughout: if the source carries fiber it's persisted as
+// a whole-gram number; if not (older entries / hand-entered foods without it),
+// the field is left undefined and re-log paths will simply skip fiber for that
+// item rather than fabricate a zero.
 export function toSavedFood(src: {
   name: string;
   brand?: string;
@@ -122,8 +141,9 @@ export function toSavedFood(src: {
   protein: number;
   carbs: number;
   fat: number;
+  fiber?: number;
   quantityLabel?: string;
-  per100g?: Macros;
+  per100g?: { calories: number; protein: number; carbs: number; fat: number; fiber?: number };
   barcode?: string;
 }): SavedFood {
   return {
@@ -134,6 +154,7 @@ export function toSavedFood(src: {
     protein: Math.round(src.protein || 0),
     carbs: Math.round(src.carbs || 0),
     fat: Math.round(src.fat || 0),
+    fiber: typeof src.fiber === "number" ? Math.round(src.fiber) : undefined,
     quantityLabel: src.quantityLabel,
     per100g: src.per100g,
     barcode: src.barcode,
@@ -166,7 +187,9 @@ export function removeSavedMeal(p: Profile, id: string): Profile {
   return { ...p, savedMeals: (p.savedMeals ?? []).filter((m) => m.id !== id) };
 }
 
-// Build a loggable FoodEntry from a saved food.
+// Build a loggable FoodEntry from a saved food. Fiber threads through when the
+// saved food has it (newer saves); older saves without fiber pass undefined and
+// the resulting entry won't contribute to the day's fiber sum.
 export function entryFromSaved(
   s: SavedFood,
   date: string,
@@ -181,6 +204,7 @@ export function entryFromSaved(
       protein: s.protein,
       carbs: s.carbs,
       fat: s.fat,
+      fiber: s.fiber,
       per100g: s.per100g,
       barcode: s.barcode,
       date,
@@ -249,6 +273,10 @@ function toHit(prod: OffProduct): FoodHit | null {
       protein: num(n["proteins_100g"]) ?? 0,
       carbs: num(n["carbohydrates_100g"]) ?? 0,
       fat: num(n["fat_100g"]) ?? 0,
+      // OFF stores fiber under `fiber_100g` (same shape as protein/fat). Many
+      // crowdsourced records leave it blank; treat missing as 0 so scaleHit
+      // produces a real number rather than NaN.
+      fiber: num(n["fiber_100g"]) ?? 0,
     };
   }
   const sg = num(prod.serving_quantity);
@@ -264,6 +292,7 @@ function toHit(prod: OffProduct): FoodHit | null {
 }
 
 // Macros for `grams` of a hit (rounded). Falls back to ZERO if no per-100g data.
+// Fiber scales linearly like the other macros.
 export function scaleHit(hit: FoodHit, grams: number): Macros {
   if (!hit.per100g) return { ...ZERO };
   const f = grams / 100;
@@ -272,6 +301,7 @@ export function scaleHit(hit: FoodHit, grams: number): Macros {
     protein: Math.round(hit.per100g.protein * f),
     carbs: Math.round(hit.per100g.carbs * f),
     fat: Math.round(hit.per100g.fat * f),
+    fiber: Math.round(hit.per100g.fiber * f),
   };
 }
 

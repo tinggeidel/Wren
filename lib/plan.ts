@@ -213,5 +213,7 @@ export function dayTargets(profile: Profile, intensity: DayIntensity): Macros | 
   const protein = base.protein;
   const fat = base.fat;
   const carbs = Math.max(0, Math.round((calories - protein * 4 - fat * 9) / 4 / 5) * 5);
-  return { calories, protein, carbs, fat };
+  // Fiber tracks the base target on cycled days — it's a daily-habit number
+  // (driven by total kcal), not an intensity dial like calories.
+  return { calories, protein, carbs, fat, fiber: base.fiber };
 }

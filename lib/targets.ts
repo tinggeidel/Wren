@@ -1,6 +1,20 @@
 import { Profile, ActivityLevel } from "./types";
 
-export type Targets = { calories: number; protein: number; carbs: number; fat: number };
+export type Targets = {
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+  fiber: number;
+};
+
+// Fiber target formula (Ting-confirmed): max(25, round(kcal / 1000 * 14)).
+// Examples: 2000 kcal -> 28; 1500 kcal -> 25 (floor wins); 2100 kcal -> 29.
+// This is a RECOMMENDATION floor, not an ED-safety primitive — the 1200 kcal /
+// BMR safety floor on calories is unrelated and stays in computeTargets.
+export function fiberFromCalories(calories: number): number {
+  return Math.max(25, Math.round((calories / 1000) * 14));
+}
 
 // Absolute hard minimum daily calorie floor for adult women, applied ON TOP of
 // the Mifflin-St Jeor BMR floor. 1200 kcal is the conventional, widely-cited
@@ -84,7 +98,16 @@ export function computeTargets(p: Profile): Targets | null {
   if (p.customTargets) {
     // Trust the user's saved override verbatim. She passed the floor warning at
     // save-time; recomputing here would erase her choice.
-    return { ...p.customTargets };
+    //
+    // Back-compat: profiles saved before fiber was tracked persist a
+    // customTargets without `fiber`. Fill it from the formula on read so the
+    // rest of the app sees a complete Targets bundle and her own custom
+    // calorie/protein/carbs/fat are preserved verbatim. Once she opens the
+    // Macros editor and saves, the persisted bundle will include fiber.
+    const ct = p.customTargets;
+    const fiber =
+      typeof ct.fiber === "number" && !isNaN(ct.fiber) ? ct.fiber : fiberFromCalories(ct.calories);
+    return { ...ct, fiber };
   }
   const kg = parseWeightKg(p.weight || "");
   const bmr = computeBMR(p);
@@ -115,11 +138,13 @@ export function computeTargets(p: Profile): Targets | null {
   const fat = (calories * 0.27) / 9;
   const carbs = (calories - protein * 4 - fat * 9) / 4;
 
+  const roundedCal = Math.round(calories / 10) * 10;
   return {
-    calories: Math.round(calories / 10) * 10,
+    calories: roundedCal,
     protein: Math.round(protein / 5) * 5,
     carbs: Math.max(0, Math.round(carbs / 5) * 5),
     fat: Math.round(fat / 5) * 5,
+    fiber: fiberFromCalories(roundedCal),
   };
 }
 
@@ -153,10 +178,12 @@ export function recomputeMacrosFromCalories(p: Profile, calories: number): Targe
   const protein = proteinPerKg * kg;
   const fat = (safeCal * 0.27) / 9;
   const carbs = (safeCal - protein * 4 - fat * 9) / 4;
+  const roundedCal = Math.round(safeCal / 10) * 10;
   return {
-    calories: Math.round(safeCal / 10) * 10,
+    calories: roundedCal,
     protein: Math.round(protein / 5) * 5,
     carbs: Math.max(0, Math.round(carbs / 5) * 5),
     fat: Math.round(fat / 5) * 5,
+    fiber: fiberFromCalories(roundedCal),
   };
 }

@@ -80,8 +80,12 @@ export type Profile = {
   // soft-warning + explicit confirm before saving a sub-floor number, and the
   // Coach's set_targets tool refuses sub-floor entirely (the Coach maintains
   // its own ED_SAFETY_RULES stance even when the user already chose to
-  // override). All four numbers move together — see lib/targets.ts.
-  customTargets?: { calories: number; protein: number; carbs: number; fat: number };
+  // override). All five numbers move together — see lib/targets.ts.
+  //
+  // Back-compat: profiles saved before fiber was tracked may persist a
+  // customTargets without `fiber`. lib/targets.ts back-fills the field from
+  // the formula on read so the rest of the app sees a complete bundle.
+  customTargets?: { calories: number; protein: number; carbs: number; fat: number; fiber: number };
   // ISO date the override was set (optional, for Coach context "her targets
   // are custom since YYYY-MM-DD" — not load-bearing, just signal).
   customTargetsSetAt?: string;
@@ -183,6 +187,8 @@ export const ACTIVITY_LABELS: Record<ActivityLevel, string> = {
 export type FoodSource = "search" | "barcode" | "manual" | "coach" | "photo" | "saved" | "meal";
 
 // A food the user explicitly saved to reuse (a template, not tied to a date).
+// Fiber is optional for back-compat — saved foods created before fiber tracking
+// don't have the field; new ones (from OFF, manual save, edit) will.
 export type SavedFood = {
   id: string;
   name: string;
@@ -191,8 +197,9 @@ export type SavedFood = {
   protein: number;
   carbs: number;
   fat: number;
+  fiber?: number;
   quantityLabel?: string;
-  per100g?: { calories: number; protein: number; carbs: number; fat: number };
+  per100g?: { calories: number; protein: number; carbs: number; fat: number; fiber?: number };
   barcode?: string;
 };
 
@@ -204,6 +211,10 @@ export type WeightEntry = { date: string; lbs: number };
 
 // One logged food. Macros are stored for the AMOUNT she logged, so a day's
 // totals are a plain deterministic sum (the durable fix for the calorie bug).
+//
+// `fiber` is optional for BACK-COMPAT: entries logged before fiber was tracked
+// will not have the field. All summing paths must treat `undefined` as 0
+// (see consumedTotals in lib/food.ts).
 export type FoodEntry = {
   id: string;
   date: string; // "YYYY-MM-DD"
@@ -213,16 +224,19 @@ export type FoodEntry = {
   protein: number; // grams
   carbs: number; // grams
   fat: number; // grams
+  fiber?: number; // grams; optional for back-compat
   quantityLabel?: string; // human label e.g. "150 g", "2 eggs", "1 container"
   source: FoodSource;
   barcode?: string;
   // Optional per-100g basis kept so the quantity editor can rescale cleanly.
-  per100g?: { calories: number; protein: number; carbs: number; fat: number };
+  per100g?: { calories: number; protein: number; carbs: number; fat: number; fiber?: number };
   createdAt: number;
 };
 
-// Macro bundle reused for totals and targets math.
-export type Macros = { calories: number; protein: number; carbs: number; fat: number };
+// Macro bundle reused for totals and targets math. Fiber is included so a day's
+// consumed totals and the target line both carry it; per-food `per100g` keeps
+// fiber optional since older OFF records and older entries may not have it.
+export type Macros = { calories: number; protein: number; carbs: number; fat: number; fiber: number };
 
 export const WATER_GOAL_CUPS = 8;
 

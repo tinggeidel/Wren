@@ -243,12 +243,15 @@ export default function CoachScreen({
           protein: a.protein ?? 0,
           carbs: a.carbs ?? 0,
           fat: a.fat ?? 0,
+          // Pass fiber only when the model actually estimated one — preserves
+          // the "undefined contributes 0" back-compat in consumedTotals.
+          fiber: typeof a.fiber === "number" ? a.fiber : undefined,
         },
         "coach"
       );
       const next = await updateProfile((p) => addEntry(p, entry));
       const t = consumedTotals(next, today);
-      return `Logged ${entry.name}${entry.quantityLabel ? ` (${entry.quantityLabel})` : ""}: ${entry.calories} kcal, ${entry.protein}g protein. Today's running total is now ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat.`;
+      return `Logged ${entry.name}${entry.quantityLabel ? ` (${entry.quantityLabel})` : ""}: ${entry.calories} kcal, ${entry.protein}g protein. Today's running total is now ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat, ${t.fiber}g fiber.`;
     }
     if (name === "log_water") {
       const a = input as LogWaterArgs;
@@ -511,19 +514,28 @@ export default function CoachScreen({
       if (typeof a.calories === "number" && floor != null && a.calories < floor) {
         return `Refused: cannot set calories below the BMR floor of ${floor} kcal. The user can change it herself in Settings if she really wants.`;
       }
-      // Build the new customTargets bundle. The override is all-four-numbers
-      // together (per the design — full granularity, not partial overlay over
-      // the formula), so any field she didn't specify is filled from her
-      // current effective targets. When ONLY calories was specified, use the
-      // formula to auto-distribute the three macros — this is what the prompt
-      // tells the model it can do.
+      // Build the new customTargets bundle. The override is all-FIVE-numbers
+      // together (calories/protein/carbs/fat/fiber — full granularity, not
+      // partial overlay over the formula), so any field she didn't specify is
+      // filled from her current effective targets. When ONLY calories was
+      // specified, use the formula to auto-distribute the four macros (incl
+      // fiber) — this is what the prompt tells the model it can do. Fiber
+      // doesn't have a safety floor; only the calorie BMR floor check above
+      // applies.
       const current = computeTargets(profileRef.current);
       const calOnly =
         typeof a.calories === "number" &&
         typeof a.protein !== "number" &&
         typeof a.carbs !== "number" &&
-        typeof a.fat !== "number";
-      let next: { calories: number; protein: number; carbs: number; fat: number } | null = null;
+        typeof a.fat !== "number" &&
+        typeof a.fiber !== "number";
+      let next: {
+        calories: number;
+        protein: number;
+        carbs: number;
+        fat: number;
+        fiber: number;
+      } | null = null;
       if (calOnly) {
         const auto = recomputeMacrosFromCalories(profileRef.current, a.calories!);
         if (!auto) {
@@ -534,14 +546,22 @@ export default function CoachScreen({
         // Need a baseline to fill any unspecified fields. Without weight/age
         // on the profile and no full override already, we can't construct a
         // sensible target from a partial spec.
-        if (!current && (typeof a.protein !== "number" || typeof a.carbs !== "number" || typeof a.fat !== "number" || typeof a.calories !== "number")) {
-          return "Refused: she hasn't set enough body info (age, height, weight) for me to fill in the rest. Ask her to add it in Settings, or specify all four numbers.";
+        if (
+          !current &&
+          (typeof a.protein !== "number" ||
+            typeof a.carbs !== "number" ||
+            typeof a.fat !== "number" ||
+            typeof a.fiber !== "number" ||
+            typeof a.calories !== "number")
+        ) {
+          return "Refused: she hasn't set enough body info (age, height, weight) for me to fill in the rest. Ask her to add it in Settings, or specify all five numbers (calories, protein, carbs, fat, fiber).";
         }
         next = {
           calories: typeof a.calories === "number" ? Math.round(a.calories) : current!.calories,
           protein: typeof a.protein === "number" ? Math.round(a.protein) : current!.protein,
           carbs: typeof a.carbs === "number" ? Math.round(a.carbs) : current!.carbs,
           fat: typeof a.fat === "number" ? Math.round(a.fat) : current!.fat,
+          fiber: typeof a.fiber === "number" ? Math.round(a.fiber) : current!.fiber,
         };
       }
       // Second-pass refusal: if any merge produced sub-floor calories (e.g. she
@@ -556,7 +576,7 @@ export default function CoachScreen({
         customTargets: next!,
         customTargetsSetAt: toISODate(new Date()),
       }));
-      return `Updated her targets to ${next.calories} kcal, ${next.protein}g protein, ${next.carbs}g carbs, ${next.fat}g fat. She can see and edit them in Settings.`;
+      return `Updated her targets to ${next.calories} kcal, ${next.protein}g protein, ${next.carbs}g carbs, ${next.fat}g fat, ${next.fiber}g fiber. She can see and edit them in Settings.`;
     }
     return `Unknown tool ${name}.`;
   };
