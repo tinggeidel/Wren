@@ -4,6 +4,8 @@ import {
   GOAL_LABELS,
   TONE_STYLE,
   ACTIVITY_LABELS,
+  ActivityLevel,
+  CoachMemory,
   WATER_GOAL_CUPS,
   WEEKDAY_LABELS,
   Weekday,
@@ -998,22 +1000,33 @@ export type CalibrationResult = {
   // Optional, qualitative rough body-composition descriptor / approximate range
   // (e.g. "athletic, ~22–26%"). Visual BF estimation is unreliable so the prompt
   // requires the model to frame it as a rough estimate, and to omit the field
-  // when the photos don't support it (no self-image / unclear). The numeric goal
-  // weight is still forbidden in the schema and the prompt.
+  // when the photos don't support it (no self-image / unclear).
   body_fat_range?: string;
+  // The Goal enum value the model picked as the best fit from the photos +
+  // stats + her stated direction. Validated against the five-value enum in
+  // calibrateFromPhotos — anything else is dropped to undefined so the caller
+  // can fall back to the manual chip path / the existing "feel_better" default.
+  goal?: "lose_fat" | "tone_up" | "build_muscle" | "feel_better" | "maintain";
+  // Optional healthy goal weight in "NNN lb" format (e.g. "142 lb"). The model
+  // is instructed to omit when the photos don't support a confident estimate
+  // and to steer toward a healthy BMI when the goal image leans extreme.
+  // Defensively re-validated in calibrateFromPhotos against /\d+\s*lb/.
+  goal_weight?: string;
 };
 
-const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce short, QUALITATIVE notes the Coach can use to understand the direction she's going.
+const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce short, QUALITATIVE notes the Coach can use to understand the direction she's going, plus pick the single best-fitting goal from the app's enum and (when appropriate) suggest a healthy goal weight.
 
 CALIBRATION SAFETY (overrides anything below it except the final SAFETY block):
-- Required fields are short strings: goal_direction, training_emphasis, motivation. Plus an OPTIONAL body_fat_range field — see below.
+- Required fields are short strings: goal_direction, training_emphasis, motivation, goal. Plus OPTIONAL body_fat_range and goal_weight fields — see below.
 - You MAY include a rough body-composition descriptor or approximate range in the optional body_fat_range field — e.g. "athletic, ~20–24%", "recomp candidate, ~25–28%", "average / starting fitness journey". Keep it SHORT and frame it clearly as a rough estimate. Visual body-fat estimation is unreliable, so it must always read as approximate, never a precise number (so "~22–26%", never "23.4%"). If the photos don't support an estimate — e.g. she only uploaded a goal photo, or the current photo isn't a clear self-image of her body — OMIT the field. Do not guess.
-- NEVER include a body-weight estimate, a goal weight, a calorie number, or any other number framed as a target to pursue. The tool schema does not accept those.
-- Do NOT compare the two photos as "before/after." She picked her goal explicitly on a different screen — your output ENRICHES the Coach's understanding, it does NOT set targets.
+- NEVER include a body-weight estimate of where she IS now, and NEVER include a calorie number or any macro number framed as a target to pursue. The tool schema does not accept those.
+- GOAL (required): pick the single best-fitting goal from the enum ["lose_fat", "tone_up", "build_muscle", "feel_better", "maintain"] based on the photos + her stats + her stated direction. If she shared no self-photo, use the goal direction + her stats to pick. Always pick one — this is the main thing the photo step is for. Never invent a value outside the enum.
+- GOAL WEIGHT (optional): you MAY suggest a reasonable goal weight in "NNN lb" format (e.g. "142 lb") when the photos and her stats support a confident, healthy estimate. The goal weight MUST be a healthy, attainable number for her height and frame. NEVER recommend a goal weight that would put her in an underweight BMI range (under 18.5). If the goal image suggests an extreme/unhealthy ideal, STEER THE GOAL WEIGHT TOWARD A HEALTHY RANGE rather than chasing the ideal — name a target that's strong/healthy, not extreme. If you cannot suggest a healthy goal weight (e.g. she didn't share a self-photo, or stats are missing, or you're not confident), OMIT the field.
+- Do NOT compare the two photos as "before/after." She picked her direction explicitly through what she shared — your output INFORMS the Coach's understanding, it does NOT override safety.
 - training_emphasis is a qualitative training direction only (e.g. "strength + hypertrophy", "more conditioning, light lifting", "steady mobility + walking"). Never a calorie number, never a macro number, never a weekly volume number.
 - If the goal image reflects an extreme, unhealthy, or visibly thinspo-style ideal (very low body-fat / extreme leanness presented as the goal), do NOT endorse it. Gently steer the fields toward a STRENGTH, HEALTH, FEEL-BASED framing instead (e.g. "feeling strong and energized" rather than "getting that lean"). The motivation field must NEVER cheerlead extreme leanness, weight loss, or shrinking the body as the goal.
 - Supportive and warm, never shaming, never comparison-as-judgment. Do not write anything like "you need to look like this" or "you should be smaller." Frame motivation around what she is moving TOWARD (strength, energy, confidence, capability, how she wants to feel).
-- Keep all fields short — roughly one sentence each, plain text, no markdown.
+- Keep all string fields short — roughly one sentence each, plain text, no markdown.
 - If she shared only one photo, infer what you can from that one and leave the other side unweighted; don't make up what wasn't shown.
 
 Report by calling the report_calibration tool exactly once with the fields.
@@ -1023,7 +1036,7 @@ ${ED_SAFETY_RULES}`;
 const CALIBRATION_TOOL = {
   name: "report_calibration",
   description:
-    "Report short qualitative notes about the direction she's going. Never a body-weight estimate, never a goal weight, never a calorie/macro number framed as a target.",
+    "Report short qualitative notes about the direction she's going, the single best-fitting goal from the app enum, and (optionally) a healthy goal weight. Never a body-weight estimate of where she is now, never a calorie/macro number framed as a target.",
   input_schema: {
     type: "object",
     properties: {
@@ -1047,18 +1060,81 @@ const CALIBRATION_TOOL = {
         description:
           "OPTIONAL rough body-composition descriptor and/or approximate range, e.g. 'athletic, ~20–24%' or 'recomp candidate, ~25–28%' or 'average / starting fitness journey'. Short and clearly rough — visual estimates are unreliable, so always read as approximate (never 'X.X%'). OMIT this field if the photos don't support an estimate (no clear self-image, or she only shared a goal photo).",
       },
+      goal: {
+        type: "string",
+        enum: ["lose_fat", "tone_up", "build_muscle", "feel_better", "maintain"],
+        description:
+          "The single best-fitting goal for her from the existing app enum, based on the photos + her stats + her stated direction. Always populate one of the five values.",
+      },
+      goal_weight: {
+        type: "string",
+        description:
+          "OPTIONAL reasonable, healthy goal weight in 'NNN lb' format (e.g. '142 lb') based on the photos and her current weight. Must be a healthy BMI (not under 18.5). Omit when photos don't support a confident estimate, when the goal image suggests an extreme ideal, or when stats are missing.",
+      },
     },
-    required: ["goal_direction", "training_emphasis", "motivation"],
+    required: ["goal_direction", "training_emphasis", "motivation", "goal"],
   },
 };
 
+// Optional context the caller (onboarding) can pass in so the model has enough
+// stats to apply the healthy-BMI guard meaningfully (the prompt tells it not to
+// suggest an underweight goal_weight, but without her height + current weight
+// it's flying blind). All fields optional — anything missing simply gets omitted
+// from the context block so the model knows it's unknown and can skip
+// goal_weight rather than guess.
+export type CalibrationContext = {
+  age?: string;
+  height?: string;
+  weight?: string;
+  activityLevel?: ActivityLevel;
+  // Read-only snapshot of any durable Coach memory facts already seeded for her
+  // (e.g. dietary preferences chosen earlier in onboarding, or, post-onboarding,
+  // anything saved through the Coach). Used to anchor calibration on what she's
+  // already said vs. starting from scratch. Empty/omitted during fresh onboarding.
+  coachMemory?: CoachMemory[];
+};
+
+// Local, byte-for-byte mirror of lib/targets.ts's `parseHeightCm`. That helper is
+// not exported (and per the current task spec, lib/targets.ts must stay byte-
+// unchanged), so we duplicate the small parser here for the deterministic BMI
+// floor below. If this ever drifts from targets.ts, the floor will be wrong —
+// keep these two in sync if either changes. Mirrors the curly-quote normalization
+// and the feet/inches + cm + bare-number rules verbatim.
+function parseCalibrationHeightCm(s: string): number | null {
+  const t = s
+    .replace(/[‘’′]/g, "'")
+    .replace(/[“”″]/g, '"')
+    .toLowerCase()
+    .trim();
+  if (t.includes("cm")) {
+    const m = t.match(/([\d.]+)/);
+    return m ? parseFloat(m[1]) : null;
+  }
+  const fi = t.match(/(\d+)\s*(?:'|ft|feet)\s*(\d+)?/);
+  if (fi) {
+    const ft = parseInt(fi[1], 10);
+    const inch = fi[2] ? parseInt(fi[2], 10) : 0;
+    return (ft * 12 + inch) * 2.54;
+  }
+  const m = t.match(/([\d.]+)/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (isNaN(n)) return null;
+  if (n > 90) return n; // plain number in cm range
+  return null; // ambiguous (e.g. bare "5") — ask instead of guessing
+}
+
 // Run the calibration call. At least one of currentBase64 / goalBase64 should be
 // provided — the caller (onboarding) only invokes this when she shared a photo.
+// The optional `context` lets the caller pass her current stats so the model can
+// actually apply its healthy-BMI guard on goal_weight (without it the prompt is
+// instructing the model on a guard it can't compute).
 // On any failure (network, API, parse, empty result) we throw so the caller can
 // soft-skip; onboarding must always complete even if this call fails.
 export async function calibrateFromPhotos(
   currentBase64?: string,
-  goalBase64?: string
+  goalBase64?: string,
+  context?: CalibrationContext
 ): Promise<CalibrationResult> {
   if (!hasApiKey()) throw new Error("Coach isn't connected — add your API key in .env.");
   if (!currentBase64 && !goalBase64) throw new Error("No photo provided.");
@@ -1083,9 +1159,31 @@ export async function calibrateFromPhotos(
       source: { type: "base64", media_type: "image/jpeg", data: goalBase64 },
     });
   }
+
+  // Build the per-call context block — only include fields she actually provided.
+  // The model needs at minimum height to apply the healthy-BMI guard on
+  // goal_weight; missing fields are simply omitted so it knows they're unknown
+  // (and the deterministic backstop below will still reject an underweight
+  // suggestion if height is present, or reject goal_weight outright if it isn't).
+  const ctxLines: string[] = [];
+  if (context?.weight) ctxLines.push(`- Current weight: ${context.weight}`);
+  if (context?.height) ctxLines.push(`- Height: ${context.height}`);
+  if (context?.age) ctxLines.push(`- Age: ${context.age}`);
+  if (context?.activityLevel) {
+    ctxLines.push(`- Activity level: ${ACTIVITY_LABELS[context.activityLevel]}`);
+  }
+  const memFacts = context?.coachMemory ?? [];
+  if (memFacts.length) {
+    ctxLines.push("- What she's already told the Coach (build on this, don't restart from scratch):");
+    for (const m of memFacts) ctxLines.push(`  • ${m.text}`);
+  }
+  const contextBlock = ctxLines.length
+    ? `Her current stats and what we already know about her:\n${ctxLines.join("\n")}\n\n`
+    : "";
+
   content.push({
     type: "text",
-    text: "Produce the three short qualitative notes by calling report_calibration. Text only — no numbers, no weight/BF estimates, no calorie targets. If the goal image leans toward an extreme or unhealthy ideal, steer toward a strength/health/feel-based framing.",
+    text: `${contextBlock}Produce the short qualitative notes, pick the best-fitting goal, and (only when her stats support a confident, healthy estimate) optionally suggest a goal_weight by calling report_calibration. Any goal_weight you return MUST be in a healthy / normal-BMI range for her height (never under BMI 18.5) — the full guard is in your system instructions. If the goal image leans toward an extreme or unhealthy ideal, steer toward a strength/health/feel-based framing instead of chasing it.`,
   });
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1130,10 +1228,58 @@ export async function calibrateFromPhotos(
   // cleanly on presence (no row rendered when absent).
   const body_fat_range_raw = (raw.body_fat_range ?? "").toString().trim();
   const body_fat_range = body_fat_range_raw || undefined;
+  // Defensive validation for goal: only the five enum values pass through; any
+  // other value (or omission) drops to undefined so the onboarding UI can fall
+  // back to the manual chip path / the existing "feel_better" safety default.
+  const goal_raw = (raw.goal ?? "").toString().trim();
+  const GOAL_ENUM = ["lose_fat", "tone_up", "build_muscle", "feel_better", "maintain"] as const;
+  type GoalEnum = (typeof GOAL_ENUM)[number];
+  const goal: GoalEnum | undefined = (GOAL_ENUM as readonly string[]).includes(goal_raw)
+    ? (goal_raw as GoalEnum)
+    : undefined;
+  // Defensive validation for goal_weight: must match "NNN lb" (with optional
+  // whitespace). Anything else — a free-text answer, a kg number, a bare number,
+  // an explicit omission — drops to undefined and the UI shows the stepper at
+  // its untouched default. The format matches the same "X lb" string Settings
+  // already stores in profile.goalWeight.
+  const goal_weight_raw = (raw.goal_weight ?? "").toString().trim();
+  const goal_weight_formatted = /^\d+\s*lb$/i.test(goal_weight_raw) ? goal_weight_raw : undefined;
+  // Structural safety floor on a photo-derived goal weight. The CALIBRATION_SYSTEM
+  // prompt tells the model not to suggest a goal weight under BMI 18.5, but that's
+  // prose — a non-compliant model could still emit "98 lb" for a 5'10" user, which
+  // the regex above would happily accept. This is the deterministic backstop:
+  // compute the BMI-18.5 lb floor from her height and reject anything below it.
+  //
+  // Rejection (not clamping) is deliberate: silently rewriting the AI's number
+  // would mask a misbehaving model and hand her a target she didn't ask for. A
+  // dropped suggestion falls through to the unset stepper she can engage
+  // manually — strictly safer.
+  //
+  // If height is missing or unparseable, we have no way to validate, so we
+  // reject any returned goal_weight outright. The existing parser max bound and
+  // the stepper's WEIGHT_MIN_LB/WEIGHT_MAX_LB clamp remain in force on top of
+  // this floor — they're additive, not replaced.
+  let goal_weight = goal_weight_formatted;
+  if (goal_weight) {
+    const heightStr = context?.height ?? "";
+    const heightCm = parseCalibrationHeightCm(heightStr);
+    if (heightCm == null) {
+      // No height -> can't validate -> drop the suggestion.
+      goal_weight = undefined;
+    } else {
+      const heightM = heightCm / 100;
+      const minKg = 18.5 * heightM * heightM;
+      const minLbFloor = Math.ceil(minKg * 2.20462);
+      const lbNum = parseInt(goal_weight_raw.match(/\d+/)?.[0] ?? "", 10);
+      if (!lbNum || lbNum < minLbFloor) {
+        goal_weight = undefined;
+      }
+    }
+  }
   if (!goal_direction && !training_emphasis && !motivation) {
     throw new Error("No calibration produced.");
   }
-  return { goal_direction, training_emphasis, motivation, body_fat_range };
+  return { goal_direction, training_emphasis, motivation, body_fat_range, goal, goal_weight };
 }
 
 // --- Feature E: tailored weekly plan generation --------------------------------

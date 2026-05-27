@@ -201,10 +201,16 @@ function formatHeight(totalIn: number): string {
 // The lean step list. Body stats, cycle, diet, and photos are all skippable —
 // the app and Coach already tolerate missing fields, and the Coach can ask for
 // stats later. "photos" is an optional, ED-safety-bounded calibration step that
-// only seeds qualitative Coach memory facts; it never changes macros (see the
-// photos step body and lib/coach.ts calibrateFromPhotos for the safety contract).
-// "start" is the final fork: create a plan vs. chat with the Coach.
-const STEPS = ["welcome", "basics", "body", "photos", "cycle", "diet", "tone", "start"] as const;
+// seeds qualitative Coach memory facts AND now also produces a goal pick + an
+// optional healthy goal weight (validated against the five-value Goal enum and
+// the "NNN lb" format respectively); it never changes macros (see lib/coach.ts
+// calibrateFromPhotos for the safety contract — macros still flow through
+// lib/targets.ts with its BMR / MIN_DAILY_CALORIES floor). "goals" is the
+// follow-up step that renders EITHER the auto-derived goals card (when
+// calibration succeeded) OR the manual goal-pick UI (chips + optional goal-
+// weight stepper) when she skipped photos or calibration failed. Both paths
+// land at the same finish(). "start" is the final fork: create a plan vs. chat.
+const STEPS = ["welcome", "basics", "body", "photos", "goals", "cycle", "diet", "tone", "start"] as const;
 type Step = (typeof STEPS)[number];
 
 // Where she chose to begin after onboarding (drives App's tab + plan-setup auto-open).
@@ -284,28 +290,25 @@ export default function OnboardingScreen({
   // Photo "calibration" step — strictly optional, use-then-discard.
   // We hold the local URI (for the in-step thumbnail) and the base64 (for the
   // single vision call). Both are CLEARED after the call so nothing about the
-  // photos is persisted to disk or the Profile — only the Coach's three short
-  // qualitative notes are seeded as durable memory facts. See lib/coach.ts
-  // calibrateFromPhotos for the safety contract (no numbers, no goal-weight,
-  // never overrides profile.goal, macros stay computed from stats + BMR floor).
+  // photos is persisted to disk or the Profile — only the Coach's short
+  // qualitative notes are seeded as durable memory facts, plus the picked goal
+  // and optional goal weight feed into the NEW "goals" step. See lib/coach.ts
+  // calibrateFromPhotos for the safety contract (no body-weight estimate of
+  // where she is now, no calorie targets, healthy-BMI guard on goal weight,
+  // macros still flow through lib/targets.ts with its BMR floor).
   const [currentUri, setCurrentUri] = useState<string | null>(null);
   const [currentBase64, setCurrentBase64] = useState<string | null>(null);
   const [goalUri, setGoalUri] = useState<string | null>(null);
   const [goalBase64, setGoalBase64] = useState<string | null>(null);
   const [calibrating, setCalibrating] = useState(false);
-  // Tracks the three facts seeded (if any) so we can show a brief confirm and so
-  // re-running calibration replaces rather than stacks. Local-only; not persisted.
+  // Tracks the qualitative facts seeded (if any) so re-running calibration
+  // replaces rather than stacks. Local-only; not persisted directly — folded
+  // into addMemory() at finish() time.
   const [calibratedFacts, setCalibratedFacts] = useState<string[]>([]);
-  // The structured calibration result, rendered in the confirmation card so the
-  // user can SEE that her photos produced something before we advance. Cleared
-  // back to null on retake/skip. Local-only; the three qualitative strings are
-  // seeded as durable memory via calibratedFacts at finish() time.
+  // The structured calibration result, rendered on the NEW "goals" step so the
+  // user can SEE what her photos produced and adjust the picked goal / goal
+  // weight before continuing. Cleared back to null on retake/skip. Local-only.
   const [calibrationResult, setCalibrationResult] = useState<CalibrationResult | null>(null);
-  // Confirmation overlay flag: when true the photo step swaps to a small card
-  // showing the three qualitative strings. The card stays up until the user
-  // taps Continue — no auto-advance — so she has as long as she needs to read
-  // what her photos produced.
-  const [showCalibrationConfirm, setShowCalibrationConfirm] = useState(false);
 
   function openPicker() {
     if (!lastPeriodStart) setLastPeriodStart(toISODate(new Date()));
@@ -447,10 +450,14 @@ export default function OnboardingScreen({
 
   // Run the calibration. ALWAYS resolves — never throws to the caller — because
   // onboarding must always complete. Drops the base64 either way (use-then-
-  // discard). On success returns BOTH the structured result (for the
-  // confirmation card UI) and the three short facts to be seeded into Coach
-  // memory at finish(). On failure (network/API/parse/no key/no photos),
-  // returns { result: null, facts: [] } so we soft-skip silently.
+  // discard). On success returns BOTH the structured result (for the goals-step
+  // auto-card UI) and the short qualitative facts to be seeded into Coach
+  // memory at finish(). The goal + goal_weight on the result drive the goals
+  // step's pre-fill (see advanceFromPhotos below); they're NOT seeded into
+  // coachMemory (ED-safety: goal weight is a Profile field with computeTargets
+  // discipline around it, not a free-text memory fact). On failure
+  // (network/API/parse/no key/no photos), returns { result: null, facts: [] }
+  // so we soft-skip into the manual goals card path.
   async function runCalibration(): Promise<{ result: CalibrationResult | null; facts: string[] }> {
     const cur = currentBase64;
     const dst = goalBase64;
@@ -461,7 +468,19 @@ export default function OnboardingScreen({
     if (!cur && !dst) return { result: null, facts: [] };
     if (!hasApiKey()) return { result: null, facts: [] };
     try {
-      const result = await calibrateFromPhotos(cur ?? undefined, dst ?? undefined);
+      // Pass the stats she's filled in so far so the model can apply the
+      // healthy-BMI guard on goal_weight (deterministic floor still re-checks
+      // in lib/coach.ts). All fields optional — she may have skipped Body, in
+      // which case the model is told they're unknown and will omit goal_weight.
+      // coachMemory is empty during fresh onboarding; included for forward-
+      // compatibility if calibrateFromPhotos is ever called post-onboarding.
+      const result = await calibrateFromPhotos(cur ?? undefined, dst ?? undefined, {
+        age: age || undefined,
+        height: height || undefined,
+        weight: weight || undefined,
+        activityLevel,
+        coachMemory: [],
+      });
       const facts: string[] = [];
       if (result.goal_direction) facts.push(`goal direction: ${result.goal_direction}`);
       if (result.training_emphasis) facts.push(`training emphasis: ${result.training_emphasis}`);
@@ -478,36 +497,59 @@ export default function OnboardingScreen({
 
   const isLast = stepIndex === STEPS.length - 1;
 
-  // Move to the next step from the calibration confirmation card. The card
-  // stays up until she taps Continue — no auto-advance — so she has as long
-  // as she needs to read what her photos produced.
-  function commitCalibrationAndAdvance() {
-    setShowCalibrationConfirm(false);
-    setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
-  }
-
   // Photo step advance: if she added at least one photo we run the vision call
-  // (with a small loading state). On a non-empty result we SHOW her the
-  // captured direction in a confirmation card (so she sees the photos actually
-  // produced something); the card stays up until she taps Continue. On empty
-  // result or skip, we silently advance as before. Either way the base64 is
-  // dropped before we move on (handled inside runCalibration).
+  // (with a small loading state). The structured result is held in state and
+  // its picked goal + optional goal weight pre-fill the NEXT step ("goals"),
+  // which renders EITHER the auto card (when calibration succeeded) OR the
+  // manual chip + stepper UI (when she skipped photos or calibration failed).
+  // Either way the base64 is dropped before we move on (inside runCalibration).
   async function advanceFromPhotos() {
     if (calibrating) return;
+    // If she's already calibrated once on this onboarding (e.g. she went BACK
+    // from goals to photos and is coming forward again without changing the
+    // photos), don't re-run the call — the base64 was use-then-discarded the
+    // first time, so a second runCalibration would return null and nuke the
+    // good result. Just advance straight to the goals step with what we have.
+    if (calibrationResult) {
+      setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+      return;
+    }
     setCalibrating(true);
     try {
       const { result, facts } = await runCalibration();
-      setCalibratedFacts(facts);
-      setCalibrationResult(result);
-      if (result && facts.length > 0) {
-        // Show the confirmation card; she advances when ready by tapping Continue.
-        setShowCalibrationConfirm(true);
-      } else {
-        // Soft-skip path: no card, just keep moving.
-        setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
+      // Only OVERWRITE state on success — a null result must not clobber a
+      // prior good calibration if there ever is one to clobber.
+      if (result) {
+        setCalibratedFacts(facts);
+        setCalibrationResult(result);
+        // Pre-seed the goal pick from calibration. The chip swap UI on the
+        // goals step renders this as pre-selected; she can tap a different
+        // chip to change. If the model didn't return a valid enum value,
+        // `goal` stays at its current value (default "feel_better") and she
+        // picks one manually on the goals step.
+        if (result.goal) setGoal(result.goal);
+        // Pre-seed the goal-weight stepper from calibration when the model
+        // gave a "NNN lb" value. We parse the digits, clamp to the stepper
+        // bounds, and FLIP the touched flag so finish() will persist it as
+        // the chosen value. (If she'd rather not have one, she can ignore
+        // the stepper — but with calibration we DO commit a number the model
+        // proposed.)
+        if (result.goal_weight) {
+          const match = result.goal_weight.match(/^(\d+)\s*lb$/i);
+          if (match) {
+            const n = Math.max(WEIGHT_MIN_LB, Math.min(WEIGHT_MAX_LB, parseInt(match[1], 10)));
+            if (!isNaN(n)) {
+              setGoalWeightLb(n);
+              setGoalWeightTouched(true);
+            }
+          }
+        }
       }
     } finally {
       setCalibrating(false);
+      // Always advance — auto-card path AND manual path both live on the next
+      // step ("goals"), which branches at render time on calibrationResult.
+      setStepIndex((i) => Math.min(i + 1, STEPS.length - 1));
     }
   }
 
@@ -662,9 +704,13 @@ export default function OnboardingScreen({
         )}
 
         {step === "basics" && (
+          // Name only. The goal chips moved off this step entirely — goals are
+          // now either derived from her photos (auto-card on the goals step)
+          // or picked manually on the goals step when she skips photos. This
+          // keeps the FIRST real question light: just her name.
           <View>
             <Text style={styles.title}>The basics</Text>
-            <Text style={styles.subtitle}>What should your Coach call you, and what are you here for?</Text>
+            <Text style={styles.subtitle}>What should your Coach call you?</Text>
 
             <Text style={styles.label}>Name</Text>
             <TextInput
@@ -673,23 +719,8 @@ export default function OnboardingScreen({
               onChangeText={setName}
               placeholder="Your name"
             />
-
-            <Text style={styles.label}>Your goal</Text>
-            <View style={styles.chipWrap}>
-              {GOALS.map((g) => (
-                <TouchableOpacity
-                  key={g}
-                  style={[styles.chip, goal === g && styles.chipActive]}
-                  onPress={() => setGoal(g)}
-                >
-                  <Text style={[styles.chipText, goal === g && styles.chipTextActive]}>
-                    {GOAL_LABELS[g]}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
             <Text style={styles.hint}>
-              However you frame it is fine — your Coach meets you where you are.
+              Your Coach will use this to talk with you. You can change it any time in Settings.
             </Text>
           </View>
         )}
@@ -773,22 +804,11 @@ export default function OnboardingScreen({
               {weightTouched ? `Weight ${weightLb} lb.` : "set weight — or skip both."}
             </Text>
 
-            {/* Optional goal-weight stepper. Same touched-gating + bounds as the
-                current-weight stepper. Skipping leaves goalWeight blank on the
-                Profile; she can always set or change it later in Settings. */}
-            <Text style={styles.label}>Goal weight (optional)</Text>
-            <Stepper
-              value={goalWeightLb}
-              min={WEIGHT_MIN_LB}
-              max={WEIGHT_MAX_LB}
-              display={`${goalWeightLb} lb`}
-              onChange={onGoalWeightChange}
-            />
-            <Text style={styles.hint}>
-              {goalWeightTouched
-                ? `Goal weight ${goalWeightLb} lb.`
-                : "If you have one in mind — totally optional, skip it if you'd rather not."}
-            </Text>
+            {/* Goal weight no longer asked here — it moves to the goals step,
+                either pre-filled from her photos (auto card) or via the same
+                stepper rendered alongside the manual goal chips. Same touched-
+                gating contract preserved there: no silent default into the
+                Profile. */}
 
             <Text style={styles.label}>Activity level</Text>
             <View style={styles.chipWrap}>
@@ -807,22 +827,62 @@ export default function OnboardingScreen({
           </View>
         )}
 
-        {step === "photos" && showCalibrationConfirm && calibrationResult && (
-          // Post-call confirmation: she sees that her photos actually
-          // produced something before we advance. Only the three QUALITATIVE
-          // strings render here — no numbers, no body assessment, no
-          // before/after framing (the CALIBRATION_SYSTEM prompt enforces those
-          // constraints at the model layer; this UI just displays the result).
-          // The card stays up until she taps Continue — no auto-advance — so
-          // she can read it at her own pace. Use-then-discard for the base64
-          // already happened in runCalibration.
+        {step === "goals" && calibrationResult && calibratedFacts.length > 0 && (
+          // AUTO-GOALS card: rendered ONLY when photos succeeded AND the
+          // calibration produced at least one qualitative fact. Shows the
+          // model's picked goal (chip swap, pre-selected, tap to change) and
+          // optional goal-weight stepper (pre-populated from the model's
+          // suggestion, or at its default if the model omitted goal weight —
+          // touched-flag is already flipped in advanceFromPhotos when the
+          // model proposed one, so finish() will persist it). The qualitative
+          // facts render as read-only display rows below.
+          //
+          // Visual safety: the prompt's CALIBRATION SAFETY block requires the
+          // goal weight to be a healthy-BMI number (>= 18.5) and to steer
+          // away from extreme ideals; this UI just displays whatever the
+          // validated parser returned. Macros still flow through computeTargets
+          // with the BMR / MIN_DAILY_CALORIES floor regardless of what she
+          // sets here. No before/after framing.
           <View>
-            <Text style={styles.title}>Got it</Text>
+            <Text style={styles.title}>Here's what your Coach picked</Text>
             <Text style={styles.subtitle}>
-              Here's what your Coach took from those — saved to memory and editable any time in
-              Settings. Take a look, then tap Continue when you're ready.
+              Based on your photos, here's what your Coach picked — adjust if you'd like before
+              continuing. You can change anything later in Settings.
             </Text>
 
+            <Text style={styles.label}>Your goal</Text>
+            <View style={styles.chipWrap}>
+              {GOALS.map((g) => (
+                <TouchableOpacity
+                  key={g}
+                  style={[styles.chip, goal === g && styles.chipActive]}
+                  onPress={() => setGoal(g)}
+                >
+                  <Text style={[styles.chipText, goal === g && styles.chipTextActive]}>
+                    {GOAL_LABELS[g]}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={styles.label}>Goal weight</Text>
+            <Stepper
+              value={goalWeightLb}
+              min={WEIGHT_MIN_LB}
+              max={WEIGHT_MAX_LB}
+              display={`${goalWeightLb} lb`}
+              onChange={onGoalWeightChange}
+            />
+            <Text style={styles.hint}>
+              {goalWeightTouched
+                ? `Goal weight ${goalWeightLb} lb. Adjust with −/+ if you'd rather a different number.`
+                : "Optional — tap −/+ if you have a number in mind, or skip."}
+            </Text>
+
+            {/* Read-only qualitative rows. Identical content to the old
+                confirmation card. Only renders rows that came back populated.
+                Caveat sits under the composition row because visual BF
+                estimation is unreliable — kept verbatim as a rough impression. */}
             <View style={styles.confirmCard}>
               {calibrationResult.goal_direction ? (
                 <View style={styles.confirmRow}>
@@ -842,11 +902,6 @@ export default function OnboardingScreen({
                   <Text style={styles.confirmValue}>{calibrationResult.motivation}</Text>
                 </View>
               ) : null}
-              {/* Optional body-composition row. The model omits this when the
-                  photos don't support a real estimate; we mirror that — no row
-                  if the field is absent. Caveat line sits right under it because
-                  visual BF estimation is unreliable and we want her reading it
-                  as a rough impression, not a verdict. */}
               {calibrationResult.body_fat_range ? (
                 <View style={styles.confirmRow}>
                   <Text style={styles.confirmLabel}>Composition (rough estimate)</Text>
@@ -857,14 +912,58 @@ export default function OnboardingScreen({
                 </View>
               ) : null}
             </View>
-
-            <TouchableOpacity style={styles.continueBtn} onPress={commitCalibrationAndAdvance}>
-              <Text style={styles.continueBtnText}>Continue</Text>
-            </TouchableOpacity>
           </View>
         )}
 
-        {step === "photos" && !showCalibrationConfirm && (
+        {step === "goals" && !(calibrationResult && calibratedFacts.length > 0) && (
+          // MANUAL goals card: rendered when she skipped photos OR calibration
+          // failed (network/API/parse/no key). Same goal chips as the original
+          // basics step, plus the optional goal-weight stepper that moved off
+          // the body step. Same touched-gating contract preserved: an
+          // untouched stepper leaves goalWeight blank on the Profile (no
+          // silent default), so the Coach can still ask later.
+          <View>
+            <Text style={styles.title}>Your goal</Text>
+            <Text style={styles.subtitle}>
+              Pick a goal so your Coach knows what you're after. You can change it any time in
+              Settings.
+            </Text>
+
+            <Text style={styles.label}>Your goal</Text>
+            <View style={styles.chipWrap}>
+              {GOALS.map((g) => (
+                <TouchableOpacity
+                  key={g}
+                  style={[styles.chip, goal === g && styles.chipActive]}
+                  onPress={() => setGoal(g)}
+                >
+                  <Text style={[styles.chipText, goal === g && styles.chipTextActive]}>
+                    {GOAL_LABELS[g]}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <Text style={styles.hint}>
+              However you frame it is fine — your Coach meets you where you are.
+            </Text>
+
+            <Text style={styles.label}>Goal weight (optional)</Text>
+            <Stepper
+              value={goalWeightLb}
+              min={WEIGHT_MIN_LB}
+              max={WEIGHT_MAX_LB}
+              display={`${goalWeightLb} lb`}
+              onChange={onGoalWeightChange}
+            />
+            <Text style={styles.hint}>
+              {goalWeightTouched
+                ? `Goal weight ${goalWeightLb} lb.`
+                : "If you have one in mind — totally optional, skip it if you'd rather not."}
+            </Text>
+          </View>
+        )}
+
+        {step === "photos" && (
           <View>
             <Text style={styles.title}>Your goals in pictures</Text>
             <Text style={styles.subtitle}>
@@ -1129,37 +1228,34 @@ export default function OnboardingScreen({
         )}
       </ScrollView>
 
-      {/* Sticky footer nav: Back, optional Skip on skippable steps, and Next.
-          While the calibration confirmation card is up, footer controls hide so
-          the user's only forward path is the on-card Continue button — keeps
-          her eyes on the result that just landed. */}
-      {!(step === "photos" && showCalibrationConfirm) && (
-        <View style={styles.footer}>
-          {stepIndex > 0 ? (
-            <TouchableOpacity style={styles.backBtn} onPress={back} disabled={saving || calibrating}>
-              <Text style={styles.backBtnText}>Back</Text>
-            </TouchableOpacity>
-          ) : (
-            <View style={styles.backBtnSpacer} />
-          )}
-
-          <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving || calibrating}>
-            <Text style={styles.nextBtnText}>
-              {isLast
-                ? saving
-                  ? "Setting up…"
-                  : startDest === "workout"
-                    ? "Build my plan"
-                    : "Meet your Coach"
-                : step === "photos" && calibrating
-                  ? "Reading…"
-                  : step === "photos" && !currentUri && !goalUri
-                    ? "Skip"
-                    : "Next"}
-            </Text>
+      {/* Sticky footer nav: Back and Next. The calibration confirmation card
+          used to live on the photos step and hide the footer; it now lives on
+          its own "goals" step so the footer always renders. */}
+      <View style={styles.footer}>
+        {stepIndex > 0 ? (
+          <TouchableOpacity style={styles.backBtn} onPress={back} disabled={saving || calibrating}>
+            <Text style={styles.backBtnText}>Back</Text>
           </TouchableOpacity>
-        </View>
-      )}
+        ) : (
+          <View style={styles.backBtnSpacer} />
+        )}
+
+        <TouchableOpacity style={styles.nextBtn} onPress={next} disabled={saving || calibrating}>
+          <Text style={styles.nextBtnText}>
+            {isLast
+              ? saving
+                ? "Setting up…"
+                : startDest === "workout"
+                  ? "Build my plan"
+                  : "Meet your Coach"
+              : step === "photos" && calibrating
+                ? "Reading…"
+                : step === "photos" && !currentUri && !goalUri
+                  ? "Skip"
+                  : "Next"}
+          </Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
