@@ -86,6 +86,64 @@ export function estimateExerciseBurn(
   return Math.round(exerciseMET(name) * weightKg * (dur / 60));
 }
 
+// Sum the per-exercise (type-aware) estimates over already-built exercises.
+// Mirrors the plan check-off path so a strength log with sets/reps but no logged
+// duration still yields a burn. Reps on a built set are numeric (no time-based
+// reps), so duration comes from set count. Load lifted is intentionally ignored
+// — burn is MET × bodyweight × time only. Null if weight is unknown or nothing
+// estimable.
+export function estimateExercisesBurn(
+  exercises: WorkoutExercise[],
+  weightKg: number | null
+): number | null {
+  if (!weightKg || weightKg <= 0 || !exercises.length) return null;
+  const total = exercises.reduce(
+    (s, x) => s + (estimateExerciseBurn(x.name, undefined, x.sets?.length || 1, weightKg) ?? 0),
+    0
+  );
+  return total > 0 ? total : null;
+}
+
+// --- Single source of truth for landing a burn number on a log ----------------
+// Default durations used only when NO duration was entered, so a log is never
+// left un-estimated. Tunable.
+export const DEFAULT_STRENGTH_MIN = 45;
+export const DEFAULT_ACTIVITY_MIN = 30;
+
+export type BurnResult = { caloriesBurned?: number; burnSource?: "watch" | "estimate" };
+
+// The one place both the Workout tab and the Coach's log_workout tool resolve
+// burned calories, so the two paths can't drift. A real device number ("watch")
+// always wins. Otherwise we ESTIMATE and always try to produce a number:
+//   • strength: sum the per-exercise estimates from what she actually did; if
+//     there's no per-exercise data, fall back to a default-duration whole-workout
+//     estimate (using her entered duration when present).
+//   • activity: whole-workout estimate on the entered duration, or a default
+//     duration when none was given.
+// Returns {} only when weight is genuinely unknown — we never fabricate a
+// bodyweight. burnSource stays "estimate" for every estimated number (ED-safety:
+// estimates must read as approximate, never as a verified device total).
+export function resolveWorkoutBurn(args: {
+  kind: WorkoutKind;
+  activity?: string;
+  durationMin?: number;
+  exercises?: WorkoutExercise[];
+  watchCalories?: number | null;
+  weightKg: number | null;
+}): BurnResult {
+  const { kind, activity, durationMin, exercises, watchCalories, weightKg } = args;
+  const watch = watchCalories && watchCalories > 0 ? Math.round(watchCalories) : null;
+  if (watch) return { caloriesBurned: watch, burnSource: "watch" };
+
+  const est =
+    kind === "strength"
+      ? estimateExercisesBurn(exercises ?? [], weightKg) ??
+        estimateBurn("strength", undefined, durationMin ?? DEFAULT_STRENGTH_MIN, weightKg)
+      : estimateBurn(kind, activity, durationMin ?? DEFAULT_ACTIVITY_MIN, weightKg);
+
+  return est != null ? { caloriesBurned: est, burnSource: "estimate" } : {};
+}
+
 // Total calories burned logged on a given day.
 export function caloriesBurnedFor(p: Profile, date: string): number {
   return workoutsFor(p, date).reduce((s, e) => s + (e.caloriesBurned || 0), 0);
@@ -97,7 +155,7 @@ export function workoutsFor(p: Profile, date: string): WorkoutEntry[] {
 
 export function makeWorkout(
   partial: Omit<WorkoutEntry, "id" | "createdAt" | "date" | "source"> & { date?: string },
-  source: "manual" | "coach"
+  source: "manual" | "coach" | "plan"
 ): WorkoutEntry {
   return {
     id: newId(),
@@ -128,6 +186,24 @@ export function removeWorkout(p: Profile, date: string, id: string): Profile {
   if (next.length) workoutLogs[date] = next;
   else delete workoutLogs[date];
   return { ...p, workoutLogs };
+}
+
+// Re-date a single logged entry: pull it out of the `fromISO` bucket, rewrite its
+// `date` to `toISO`, and drop it into the `toISO` bucket. Used when a plan day is
+// rescheduled to a new weekday/date so the entry keyed at the OLD date follows the
+// day to its NEW date (otherwise it's stranded and check-off churn duplicates it).
+// No-op (returns the same profile) if no entry with `id` lives at `fromISO`, or if
+// `fromISO === toISO`. Pure; safe to compose inside an updateProfile transform.
+export function redateWorkoutEntry(
+  p: Profile,
+  id: string,
+  fromISO: string,
+  toISO: string
+): Profile {
+  if (fromISO === toISO) return p;
+  const entry = (p.workoutLogs?.[fromISO] ?? []).find((e) => e.id === id);
+  if (!entry) return p;
+  return addWorkout(removeWorkout(p, fromISO, id), { ...entry, date: toISO });
 }
 
 function allEntries(p: Profile): WorkoutEntry[] {

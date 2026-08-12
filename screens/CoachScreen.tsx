@@ -14,18 +14,23 @@ import {
   Keyboard,
   Animated,
   Easing,
-  NativeSyntheticEvent,
-  NativeScrollEvent,
 } from "react-native";
+import Svg, { Path, Circle, Rect } from "react-native-svg";
 import * as ImagePicker from "expo-image-picker";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { colors, type, spacing, radius } from "../lib/theme";
 import { toJpegBase64 } from "../lib/image";
 import {
   Profile,
   ChatMessage,
+  CoachCard,
+  CoachFoodCard,
   DayLog,
   Flow,
   EnergyLevel,
+  SavedFood,
+  FoodEntry,
+  Macros,
   WATER_GOAL_CUPS,
 } from "../lib/types";
 import { currentPhase, toISODate, cycleStarts } from "../lib/cycle";
@@ -38,43 +43,206 @@ import {
   SUMMARY_BATCH,
   ToolRunner,
   LogFoodArgs,
+  EditFoodArgs,
   LogWaterArgs,
   LogCheckinArgs,
   LogWorkoutArgs,
   AdjustDayArgs,
   MoveDayArgs,
+  ShiftPlanArgs,
   RememberFactArgs,
   ForgetFactArgs,
   SetTargetsArgs,
+  MarkBfTrendArgs,
+  SuggestMealArgs,
 } from "../lib/coach";
 import { computeTargets, targetsFloorCalories, recomputeMacrosFromCalories } from "../lib/targets";
 import { addMemory, removeMemory } from "../lib/memory";
-import { weekdayKey } from "../lib/plan";
+import {
+  weekdayKey,
+  dayExercises,
+  planDayChanged,
+  mergePlanDay,
+  dateForWeekday,
+  shiftWeekDays,
+} from "../lib/plan";
 import { detectCrisisLanguage, CRISIS_RESOURCES_MESSAGE } from "../lib/safety";
 import { loadChat, saveChat, clearChat } from "../lib/storage";
+import { stripChatFormatting } from "../lib/text";
 import {
   makeEntry,
   addEntry,
+  updateEntry,
+  entriesFor,
   addWater,
   consumedTotals,
   waterFor,
   lookupBarcode,
   scaleHit,
+  rescaleMacrosForQuantity,
   FoodHit,
+  toSavedFood,
+  saveFood,
+  findSavedFood,
 } from "../lib/food";
 import {
   makeWorkout,
   addWorkout,
+  redateWorkoutEntry,
   expandSets,
   workoutLabel,
-  estimateBurn,
+  resolveWorkoutBurn,
   profileWeightKg,
   newId as newWorkoutId,
 } from "../lib/workouts";
-import { WorkoutEntry, WorkoutExercise, PlanDay, WEEKDAY_LABELS } from "../lib/types";
+import {
+  WorkoutEntry,
+  WorkoutExercise,
+  PlanDay,
+  PlanExercise,
+  CoachPlanChangeCard,
+  CoachPlanShiftCard,
+  WEEKDAY_LABELS,
+  WEEKDAYS,
+  Weekday,
+} from "../lib/types";
 import BarcodeScanner from "./BarcodeScanner";
 
-const SUGGESTED = ["What should I eat?", "How am I doing today?"];
+// PRIVACY: the single friendly line shown (and persisted) when a Coach request
+// fails. Kept at module scope so the live error path and the load-time scrub
+// migration write byte-identical text.
+const COACH_CONNECT_ERROR =
+  "I'm having trouble connecting right now — give it a moment and try again.";
+// Legacy bubbles persisted by the old catch interpolated the raw API error after
+// this prefix — for a 429 that leaked the org UUID + console/billing URLs into
+// stored chat history. We rewrite any message starting with it on load.
+const LEAKY_ERROR_PREFIX = "Something went wrong reaching the Coach:";
+
+// One-time, idempotent scrub of already-persisted error leaks. Any assistant
+// message whose content starts with the old leak prefix is rewritten to the
+// fixed friendly line; everything else (including already-friendly messages) is
+// returned untouched, so re-running this is a no-op. Returns the same array
+// reference when nothing changed, so callers can cheaply skip a re-save.
+function scrubLeakedErrors(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false;
+  const out = messages.map((m) => {
+    if (m.role === "assistant" && m.content.startsWith(LEAKY_ERROR_PREFIX)) {
+      changed = true;
+      return { ...m, content: COACH_CONNECT_ERROR };
+    }
+    return m;
+  });
+  return changed ? out : messages;
+}
+
+// CONFABULATION GUARD (workout-trust Stage 1): compute the exercise-level diff
+// between a plan day BEFORE a write and the same slot AFTER the write. Operates
+// on the REAL saved days (never the model's tool args). Compares exercise NAMES
+// (case-insensitive, trimmed) for added/removed/kept counts, and reports whether
+// any previously-`done` exercise lost its done flag (completion preserved?). A
+// missing pre or post day is treated as an empty exercise list.
+function planDiff(
+  before: PlanDay | undefined,
+  after: PlanDay | undefined
+): { added: number; removed: number; kept: number; completionPreserved: boolean } {
+  const norm = (n: string) => n.trim().toLowerCase();
+  const beforeEx = before ? dayExercises(before) : [];
+  const afterEx = after ? dayExercises(after) : [];
+  const beforeNames = new Set(beforeEx.map((e) => norm(e.name)));
+  const afterNames = new Set(afterEx.map((e) => norm(e.name)));
+  let added = 0;
+  let kept = 0;
+  afterNames.forEach((n) => (beforeNames.has(n) ? (kept += 1) : (added += 1)));
+  let removed = 0;
+  beforeNames.forEach((n) => (afterNames.has(n) ? null : (removed += 1)));
+  // Completion is preserved when every exercise that was `done` before is still
+  // present AND still marked done after. Any checked-off exercise whose done flag
+  // is missing after the write (the destructive full-replace drops them) = false.
+  const afterDoneNames = new Set(afterEx.filter((e) => e.done).map((e) => norm(e.name)));
+  const completionPreserved = beforeEx
+    .filter((e) => e.done)
+    .every((e) => afterDoneNames.has(norm(e.name)));
+  return { added, removed, kept, completionPreserved };
+}
+
+// CONFABULATION DETECTOR (post-turn safety net). Returns true only when the
+// reply contains a sentence that BOTH (a) uses a change verb and (b) names a
+// plan/workout-specific noun in that SAME sentence — i.e. an actual claim that
+// the training plan was edited. Intentionally biased toward false negatives:
+// the authoritative PLAN UPDATED card and the system-prompt bullet are the
+// primary defenses, so it is far better to miss a confabulation than to wrongly
+// contradict a correct reply (e.g. a set_targets turn that merely mentions
+// "tomorrow's workout"). Sentences about targets/macros/food/water are excluded
+// because those legitimately produce no plan card (they use food cards or none).
+const CHANGE_VERB = /\b(updated?|moved?|pushed?|shifted?|rebuil[dt]|swapp?ed|reschedul(?:ed|e)|chang(?:ed|e))\b/i;
+const PLAN_NOUN = /\b(plan|workout|training|session|rest day|leg day|lift|lifting)\b/i;
+// Target/macro/food/water context — if present in the matched sentence, the
+// change-verb is about something legitimately card-less or food-carded.
+const TARGET_FOOD_CONTEXT =
+  /\b(target|calorie|protein|macro|carb|fat|water|meal|snack|breakfast|lunch|dinner)\b/i;
+
+function claimsPlanChange(reply: string): boolean {
+  // Split into rough sentences/clauses so the verb and noun must co-occur in the
+  // same unit, not anywhere-in-reply. Em dashes and semicolons split clauses too,
+  // since the Coach often joins a targets update and a workout aside with "—".
+  const sentences = reply.split(/(?:[.!?\n]+|\s—\s|;)/);
+  return sentences.some((s) => {
+    if (TARGET_FOOD_CONTEXT.test(s)) return false;
+    return CHANGE_VERB.test(s) && PLAN_NOUN.test(s);
+  });
+}
+
+const SUGGESTED = [
+  "how does wren actually work?",
+  "what's the cycle stuff?",
+  "I just want to talk.",
+];
+
+// Camera outline for the input-bar left affordance. Matches the mockup's clay
+// (inkMuted) stroke treatment; drawn with react-native-svg like FoodScreen's
+// icons (no new icon dependency).
+function CameraIcon({ size = 22 }: { size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 22 18" fill="none">
+      <Rect x={1} y={4} width={20} height={13} rx={2.5} stroke={colors.inkMuted} strokeWidth={1.5} />
+      <Circle cx={11} cy={10.5} r={3.5} stroke={colors.inkMuted} strokeWidth={1.5} />
+      <Path d="M7 4 L8.5 1.5 L13.5 1.5 L15 4" stroke={colors.inkMuted} strokeWidth={1.5} strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+// Up-arrow glyph for the circular send button — cream (surface) stroke on the
+// cocoa circle, per the mockup. Replaces the prior "Send" text label.
+function SendArrowIcon({ size = 24 }: { size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M12 19 L12 5 M5 12 L12 5 L19 12"
+        stroke={colors.surface}
+        strokeWidth={2.6}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
+
+// Thin right-pointing arrow for the suggested-prompt list rows — warm camel/tan
+// (handle) stroke, same hairline weight as the camera/send glyphs. Replaces the
+// prior pill chips per the mockup's left-aligned vertical list.
+function ArrowRightIcon({ size = 20 }: { size?: number }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M4 12 L20 12 M14 6 L20 12 L14 18"
+        stroke={colors.inkMuted}
+        strokeWidth={1.75}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
 
 // Friendly label for a day divider.
 function formatDayLabel(d: string): string {
@@ -159,6 +327,8 @@ export default function CoachScreen({
   profile,
   updateProfile,
   onOpenSettings,
+  clearSignal,
+  adjustRequest,
 }: {
   profile: Profile;
   // Single shared updater (App.tsx). Tool handlers route their PROFILE writes
@@ -167,19 +337,40 @@ export default function CoachScreen({
   // read the freshly-summed totals to echo back to the model.
   updateProfile: (updater: (p: Profile) => Profile) => Promise<Profile>;
   onOpenSettings: () => void;
+  // Reboot trigger from the "Clear chat history" action that now lives in
+  // Settings. CoachScreen stays MOUNTED across tab switches (App hides inactive
+  // tabs rather than unmounting them), so the on-mount kickoff effect can't
+  // re-fire after a Settings-side clear. App bumps this counter when the user
+  // clears from Settings; the effect below watches it and runs the SAME
+  // clear+reboot flow as the in-Coach handler used to, so the Coach always
+  // shows a fresh kickoff (never an empty screen). A counter (not a boolean)
+  // so repeated clears always refire the effect.
+  clearSignal: number;
+  // Set when a Workout day card's "Or ask your Coach to adjust your plan →" link
+  // is tapped (App routes the tab here AND bumps this). Carries the tapped day's
+  // real date + a human label so we can inject a day-specific CANNED opener
+  // ("What would you like to change about Thursday, May 7's workout?"). Nonce'd
+  // so re-tapping the same day re-fires; the effect below tracks the last-seen
+  // nonce in a ref so the opener appends ONCE per tap (not on every render) and
+  // never on a normal Coach-tab open (null / unchanged nonce). The opener is a
+  // deterministic template — no Anthropic call. Her REPLY then flows through the
+  // normal askCoach turn (full system prompt + ED-safety + tools + plan context).
+  adjustRequest?: { dateISO: string; label: string; nonce: number } | null;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [booting, setBooting] = useState(true);
   const [scanning, setScanning] = useState(false);
-  // Hide the suggested-prompt chips while the input is focused so the keyboard
-  // doesn't crowd the screen; they reappear on blur (keyboard dismissed).
-  const [inputFocused, setInputFocused] = useState(false);
-  // Also hide the chips while the user has scrolled up to read history; they
-  // reappear once they're back near the bottom of the chat. Default true so the
-  // chips show on open (we start scrolled to the latest message).
-  const [atBottom, setAtBottom] = useState(true);
+  // BARCODE RE-ENTRANCY: expo-camera fires onBarcodeScanned continuously while a
+  // code is in frame, so a single physical scan can deliver a burst of callbacks
+  // before React state (sending/booting) updates. These refs lock synchronously,
+  // independent of render timing, and survive the scanner's unmount (they live
+  // here, not in BarcodeScanner). scanBusyRef blocks the burst while one scan is
+  // processed; lastScanRef debounces the identical code for ~2.5s so the same
+  // barcode can't immediately re-fire, while a DIFFERENT code still gets through.
+  const scanBusyRef = useRef(false);
+  const lastScanRef = useRef<{ code: string; t: number } | null>(null);
   const scrollRef = useRef<ScrollView>(null);
   // The Coach screen lives inside App's SafeAreaView (edges top+bottom), which
   // already reserves the top inset ABOVE this KeyboardAvoidingView. With
@@ -197,6 +388,20 @@ export default function CoachScreen({
     messagesRef.current = next;
     setMessages(next);
   };
+
+  // Editorial data cards (LOGGED / SUGGESTED) accumulated DURING the current turn
+  // by runTool, then attached to the assistant message in deliver() once the turn
+  // resolves. Reset at the start of every deliver() so cards never bleed between
+  // turns. LOGGED cards are built here from log_food args (no prompt change);
+  // SUGGESTED cards come from the suggest_meal tool. Held in a ref because runTool
+  // is created once per render and must push into the live, latest array.
+  const turnCardsRef = useRef<CoachCard[]>([]);
+
+  // Which suggested foods she's already saved this session, keyed by the same
+  // name+brand identity findSavedFood/saveFood dedupe on. Drives the pill's
+  // "Saved" feedback. Seeded from the profile on save so the state survives a
+  // re-render; we also re-check the live profile when rendering (below).
+  const [savedCardKeys, setSavedCardKeys] = useState<Set<string>>(new Set());
 
   // Conversation-continuity state (the rolling summary of messages that have aged
   // out of the last-MAX_HISTORY window the API sees). Held in refs so the send
@@ -265,17 +470,6 @@ export default function CoachScreen({
     profileRef.current = profile;
   }, [profile]);
 
-  // Recompute "is the chat near its bottom?" from a scroll event and update
-  // atBottom only when the boolean actually flips (avoids a setState on every
-  // throttled scroll frame). A small threshold treats "almost at the end" as
-  // bottom, so the chips don't flicker on tiny over-scroll/bounce.
-  const NEAR_BOTTOM = 48;
-  const updateAtBottom = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
-    const near = contentOffset.y + layoutMeasurement.height >= contentSize.height - NEAR_BOTTOM;
-    setAtBottom((prev) => (prev === near ? prev : near));
-  };
-
   // When the keyboard opens, keep the latest message in view. onContentSizeChange
   // doesn't fire on keyboard show (the content height is unchanged), so the list
   // would otherwise stay scrolled where it was and the newest bubble can hide
@@ -284,13 +478,27 @@ export default function CoachScreen({
     const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
     const sub = Keyboard.addListener(showEvent, () => {
       scrollRef.current?.scrollToEnd({ animated: true });
-      // Programmatic scroll-to-end doesn't always emit onScroll, so assert the
-      // bottom state directly (chips would otherwise stay hidden if she'd been
-      // scrolled up before focusing).
-      setAtBottom(true);
     });
     return () => sub.remove();
   }, []);
+
+  // Whether to show the "OR ASK ME" suggested-prompt list. It's a first-time /
+  // onboarding hint, NOT a persistent affordance: it shows ONLY in the fresh
+  // kickoff state (the Coach has greeted but she hasn't engaged yet) and
+  // disappears the moment she does. Concretely it's gated on three things, all of
+  // which must hold:
+  //   - not booting (no half-loaded chat flashing the hint),
+  //   - the input box is empty (so the first keystroke hides it immediately, even
+  //     before she sends), and
+  //   - the conversation has no user message yet (so once she's sent anything it
+  //     stays gone for the rest of this conversation — scrolling, blur, or being
+  //     at the bottom can't bring it back).
+  // After "Clear chat history" the chat reboots to a fresh kickoff with no user
+  // messages, so this condition naturally shows the hint again — no special case.
+  // It's deliberately independent of scroll position now (the old atBottom gate
+  // caused a layout feedback loop and is gone).
+  const showSuggestions =
+    !booting && input.length === 0 && !messages.some((m) => m.role === "user");
 
   // Lets the Coach write food/water she's told about into the structured store.
   // Each call routes its profile write through the shared updateProfile, which
@@ -317,7 +525,123 @@ export default function CoachScreen({
       );
       const next = await updateProfile((p) => addEntry(p, entry));
       const t = consumedTotals(next, today);
+      // Client-side LOGGED card — built from the entry we just persisted, no
+      // prompt/model involvement. The label is uppercased for the card's
+      // editorial slot line (the quantity label if she gave one, else a generic
+      // "LOGGED" marker is added by the renderer's prefix). We use the food's
+      // quantity label when present as the slot context, else "LOGGED".
+      turnCardsRef.current.push({
+        kind: "logged",
+        label: (entry.quantityLabel || "logged").toUpperCase(),
+        name: entry.name,
+        calories: entry.calories,
+        protein: entry.protein,
+        carbs: entry.carbs,
+        fat: entry.fat,
+        fiber: typeof entry.fiber === "number" ? entry.fiber : undefined,
+        brand: entry.brand,
+        quantityLabel: entry.quantityLabel,
+      });
       return `Logged ${entry.name}${entry.quantityLabel ? ` (${entry.quantityLabel})` : ""}: ${entry.calories} kcal, ${entry.protein}g protein. Today's running total is now ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat, ${t.fiber}g fiber.`;
+    }
+    if (name === "edit_food") {
+      const a = input as EditFoodArgs;
+      const q = (a.name ?? "").trim().toLowerCase();
+      // CONFABULATION GUARD: edit_food edits ONLY an entry that already exists.
+      // If nothing matches, report that plainly and create NOTHING.
+      const todays = entriesFor(profileRef.current, today);
+      const recentFirst = [...todays].reverse();
+
+      // Word-level fuzzy match (auditor note #1): the old bidirectional substring
+      // (`n.includes(q) || q.includes(n)`) could edit the wrong entry — "chicken"
+      // silently matched "chicken salad". We require whole-word containment AND
+      // that the query includes the entry's HEAD noun (its last word), so "latte"
+      // matches "oat milk latte" but "chicken" does NOT match "chicken salad".
+      const words = (s: string) =>
+        s
+          .toLowerCase()
+          .split(/[^a-z0-9]+/i)
+          .filter(Boolean);
+      const qWords = words(q);
+      const wordMatch = (name: string): boolean => {
+        const nWords = words(name);
+        if (!qWords.length || !nWords.length) return false;
+        const nSet = new Set(nWords);
+        const head = nWords[nWords.length - 1]; // the dish's head noun
+        return qWords.every((w) => nSet.has(w)) && qWords.includes(head);
+      };
+
+      // Exact whole-name match wins (most recent first). Otherwise fall back to
+      // the word-level matcher.
+      let match = recentFirst.find((e) => e.name.trim().toLowerCase() === q);
+      if (!match) {
+        const candidates = recentFirst.filter((e) => wordMatch(e.name));
+        const distinctNames = Array.from(
+          new Set(candidates.map((e) => e.name.trim()))
+        );
+        if (distinctNames.length >= 2) {
+          // AMBIGUOUS: two+ different foods match. Don't guess — ask, mutate
+          // nothing. (Multiple logs of the SAME food aren't ambiguous — we still
+          // auto-pick the most recent below.)
+          return `A couple of things in today's log could be "${(a.name ?? "").trim()}": ${distinctNames.join(
+            ", "
+          )}. Which one did you mean?`;
+        }
+        match = candidates[0]; // exactly one food (0+ entries) or none
+      }
+      if (!match) {
+        return `I don't see "${(a.name ?? "").trim()}" in today's log — want me to add it?`;
+      }
+
+      const gaveMacros =
+        typeof a.calories === "number" ||
+        typeof a.protein === "number" ||
+        typeof a.carbs === "number" ||
+        typeof a.fat === "number" ||
+        typeof a.fiber === "number";
+      // Priority: the model's supplied macros win (it computed them for the new
+      // portion); else, if only a new quantity was given, rescale in code from
+      // the original entry. If neither yields macros, leave the macros untouched
+      // (never zero them) and just update the label.
+      let macros: Macros | null = null;
+      let newLabel = a.quantity?.trim() || match.quantityLabel;
+      if (gaveMacros) {
+        macros = {
+          calories: Math.max(0, Math.round(a.calories ?? match.calories)),
+          protein: Math.max(0, Math.round(a.protein ?? match.protein)),
+          carbs: Math.max(0, Math.round(a.carbs ?? match.carbs)),
+          fat: Math.max(0, Math.round(a.fat ?? match.fat)),
+          fiber: Math.max(0, Math.round(a.fiber ?? match.fiber ?? 0)),
+        };
+      } else if (a.quantity?.trim()) {
+        const r = rescaleMacrosForQuantity(match, a.quantity.trim());
+        if (r) {
+          macros = r.macros;
+          // Use the normalized label so a serving edit's "(… g)" tells the truth.
+          newLabel = r.label;
+        }
+      }
+
+      // Preserve the "fiber untracked" back-compat: only carry a fiber number if
+      // the original entry had one OR the model supplied one now.
+      const keepFiber = typeof match.fiber === "number" || typeof a.fiber === "number";
+      const edited: FoodEntry = {
+        ...match,
+        quantityLabel: newLabel,
+        ...(macros
+          ? {
+              calories: macros.calories,
+              protein: macros.protein,
+              carbs: macros.carbs,
+              fat: macros.fat,
+              fiber: keepFiber ? macros.fiber : undefined,
+            }
+          : {}),
+      };
+      const next = await updateProfile((p) => updateEntry(p, edited));
+      const t = consumedTotals(next, today);
+      // Report the REAL post-write state so the model can't confabulate the edit.
+      return `Updated ${edited.name}${edited.quantityLabel ? ` (${edited.quantityLabel})` : ""}: ${edited.calories} kcal, ${edited.protein}g protein, ${edited.carbs}g carbs, ${edited.fat}g fat. Today's running total is now ${t.calories} kcal, ${t.protein}g protein, ${t.carbs}g carbs, ${t.fat}g fat, ${t.fiber}g fiber.`;
     }
     if (name === "log_water") {
       const a = input as LogWaterArgs;
@@ -383,16 +707,12 @@ export default function CoachScreen({
       const kind = a.kind ?? (a.exercises?.length ? "strength" : a.activity ? "activity" : "strength");
       const date = a.date && /^\d{4}-\d{2}-\d{2}$/.test(a.date) ? a.date : today;
 
-      // Burned: use her watch number if given, else estimate in code from weight.
-      // Weight is a stable profile field — reading it from the prop ref is fine.
+      // Burned: use her watch number if given, else estimate in code from weight
+      // via the shared helper (strength sums the logged exercises, else a default
+      // duration; activity uses given or default duration) so a Coach-logged
+      // workout always lands a number. Weight is a stable profile field — reading
+      // it from the prop ref is fine.
       const kg = profileWeightKg(profileRef.current);
-      const watch = a.caloriesBurned && a.caloriesBurned > 0 ? Math.round(a.caloriesBurned) : null;
-      const est = estimateBurn(kind, a.activity, a.durationMin, kg);
-      const burn = watch
-        ? { caloriesBurned: watch, burnSource: "watch" as const }
-        : est != null
-          ? { caloriesBurned: est, burnSource: "estimate" as const }
-          : {};
       const hr = {
         avgHr: a.avgHr && a.avgHr > 0 ? Math.round(a.avgHr) : undefined,
         maxHr: a.maxHr && a.maxHr > 0 ? Math.round(a.maxHr) : undefined,
@@ -408,11 +728,25 @@ export default function CoachScreen({
             sets: expandSets(e.sets ?? 1, e.reps ?? 0, e.weight),
           }));
         if (!exercises.length) return "I didn't catch the exercises — tell me what you did.";
+        const burn = resolveWorkoutBurn({
+          kind: "strength",
+          durationMin: a.durationMin,
+          exercises,
+          watchCalories: a.caloriesBurned ?? null,
+          weightKg: kg,
+        });
         entry = makeWorkout(
           { kind: "strength", exercises, durationMin: a.durationMin, ...burn, ...hr, note: a.note, date },
           "coach"
         );
       } else {
+        const burn = resolveWorkoutBurn({
+          kind: "activity",
+          activity: a.activity,
+          durationMin: a.durationMin,
+          watchCalories: a.caloriesBurned ?? null,
+          weightKg: kg,
+        });
         entry = makeWorkout(
           {
             kind: "activity",
@@ -438,44 +772,98 @@ export default function CoachScreen({
       if (!profileRef.current.plan?.current)
         return "There's no active plan to adjust — she can create one on the Workout tab.";
       const wd = a.weekday ?? weekdayKey();
-      const kind = a.kind ?? (a.exercises?.length ? "strength" : a.activity ? "activity" : "rest");
-      const day: PlanDay = {
-        weekday: wd,
-        kind,
-        title: a.title?.trim() || (kind === "rest" ? "Rest" : "Workout"),
-        intensity: a.intensity ?? (kind === "rest" ? "rest" : "moderate"),
-        durationMin: a.durationMin,
-        note: a.note,
-        sections:
-          kind === "strength" && a.exercises?.length
-            ? [
-                {
-                  name: "Workout",
-                  exercises: a.exercises
-                    .filter((e) => e.name?.trim())
-                    .map((e) => ({
-                      id: newWorkoutId(),
-                      name: e.name.trim(),
-                      sets: e.sets,
-                      reps: e.reps,
-                      weight: e.weight,
-                      note: e.note,
-                    })),
-                },
-              ]
-            : undefined,
-        activity: kind === "activity" ? a.activity?.trim() || a.title?.trim() : undefined,
-      };
+      const dayName = wd === weekdayKey() ? "today" : WEEKDAY_LABELS[wd];
+      // CONFABULATION GUARD: capture the affected day BEFORE the write so we can
+      // diff against the day actually saved (not the model's args). If the weekday
+      // isn't in the plan at all, tell the model the truth and push no card.
+      const beforeDay = profileRef.current.plan?.current?.days.find((d) => d.weekday === wd);
+      if (!beforeDay) {
+        return `That day (${dayName}) isn't in her current plan.`;
+      }
+      // Normalize the model's exercises into PlanExercise[] (fresh ids) ONCE, so
+      // both the merge and replace paths share the same shape. Undefined means the
+      // model named no exercises (a merge then preserves the existing ones).
+      const incomingExercises: PlanExercise[] | undefined = a.exercises?.length
+        ? a.exercises
+            .filter((e) => e.name?.trim())
+            .map((e) => ({
+              id: newWorkoutId(),
+              name: e.name.trim(),
+              sets: e.sets,
+              // Model sends reps as a number in adjust_workout_day args; PlanExercise.reps
+              // is a string. Coerce here exactly like generateWeekPlan does so a numeric
+              // reps never reaches planDayChanged's .trim() (the "technical issue" crash).
+              reps: e.reps != null ? String(e.reps) : undefined,
+              weight: e.weight,
+              note: e.note,
+            }))
+        : undefined;
+
+      // Build the day to save. Default is MERGE — apply only what the model
+      // supplied and keep everything it didn't mention (exercises + completion).
+      // replace:true rebuilds the day from scratch (old destructive behavior).
+      let day: PlanDay;
+      if (a.replace) {
+        const kind =
+          a.kind ?? (incomingExercises?.length ? "strength" : a.activity ? "activity" : "rest");
+        day = {
+          weekday: wd,
+          kind,
+          title: a.title?.trim() || (kind === "rest" ? "Rest" : "Workout"),
+          intensity: a.intensity ?? (kind === "rest" ? "rest" : "moderate"),
+          durationMin: a.durationMin,
+          note: a.note,
+          sections:
+            kind === "strength" && incomingExercises?.length
+              ? [{ name: "Workout", exercises: incomingExercises }]
+              : undefined,
+          activity: kind === "activity" ? a.activity?.trim() || a.title?.trim() : undefined,
+          // A fresh rebuild discards prior completion.
+          loggedEntryId: undefined,
+        };
+      } else {
+        day = mergePlanDay(beforeDay, {
+          title: a.title,
+          kind: a.kind,
+          intensity: a.intensity,
+          durationMin: a.durationMin,
+          activity: a.activity,
+          note: a.note,
+          incomingExercises,
+          removeExercises: a.removeExercises,
+        });
+      }
+
       // Map the day into the LATEST plan inside the transform (no-op if the plan
       // was cleared concurrently), so this composes with other plan writes.
-      await updateProfile((p) => {
+      const nextProfile = await updateProfile((p) => {
         const cur = p.plan?.current;
         if (!cur) return p;
         const days = cur.days.map((d) => (d.weekday === wd ? day : d));
         return { ...p, plan: { ...p.plan!, current: { ...cur, days } } };
       });
-      const dayName = wd === weekdayKey() ? "today" : WEEKDAY_LABELS[wd];
-      return `Updated ${dayName}'s workout to "${day.title}" (${day.intensity}). It's on her Plan tab to check off.`;
+      // Read the day back from the ACTUAL saved profile. The card fires ONLY on a
+      // material change (see planDayChanged) — a no-op rewrite must not flash
+      // "PLAN UPDATED", and the tool result tells the model the truth so its prose
+      // stays honest and the post-turn net doesn't misfire.
+      const afterDay = nextProfile.plan?.current?.days.find((d) => d.weekday === wd);
+      if (!planDayChanged(beforeDay, afterDay)) {
+        return `No change — ${dayName} already looks like that.`;
+      }
+      // afterDay is defined here (planDayChanged returns false when it isn't).
+      const savedDay = afterDay!;
+      const diff = planDiff(beforeDay, savedDay);
+      const card: CoachPlanChangeCard = {
+        kind: "plan_change",
+        // Mirror the prose's "today" affordance so card and reply agree when
+        // the adjusted day is the current weekday (else show the weekday code).
+        dayLabel: wd === weekdayKey() ? "TODAY" : WEEKDAY_LABELS[wd].toUpperCase(),
+        oldTitle: beforeDay.title,
+        newTitle: savedDay.title,
+        ...diff,
+      };
+      turnCardsRef.current.push(card);
+      return `Updated ${dayName}'s workout to "${savedDay.title}" (${savedDay.intensity}). It's on her Plan tab to check off.`;
     }
     if (name === "move_workout_day") {
       const a = input as MoveDayArgs;
@@ -487,20 +875,21 @@ export default function CoachScreen({
       const from = cur.days.find((d) => d.weekday === fromArg);
       const to = cur.days.find((d) => d.weekday === toArg);
       if (!from || !to) return "Couldn't find those days in the plan.";
-      // Swap the two days' contents, keeping their weekday slots; clear completion
-      // (rescheduled = not done yet) on the day and its exercises.
+      // Swap the two days' contents, keeping their weekday slots. A reschedule
+      // moves the day's content AND its completion to the new slot — we do NOT
+      // clear loggedEntryId or the exercises' `done` flags here, so a workout she
+      // already checked off rides along to its new day instead of looking undone.
       const place = (slot: PlanDay, src: PlanDay): PlanDay => ({
         ...src,
         weekday: slot.weekday,
-        loggedEntryId: undefined,
-        sections: src.sections?.map((s) => ({
-          ...s,
-          exercises: s.exercises.map((e) => ({ ...e, done: undefined })),
-        })),
       });
+      // CONFABULATION GUARD: capture the destination slot BEFORE the write so we
+      // can diff it against what actually lands there. The "to" day is where she
+      // sees the moved workout arrive, so that's the slot the card summarizes.
+      const beforeTo = cur.days.find((d) => d.weekday === toArg);
       // Apply the swap against the LATEST plan inside the transform, re-finding
       // the days there so a concurrent plan edit isn't clobbered.
-      await updateProfile((p) => {
+      const nextProfile = await updateProfile((p) => {
         const cur2 = p.plan?.current;
         if (!cur2) return p;
         const f = cur2.days.find((d) => d.weekday === fromArg);
@@ -509,9 +898,104 @@ export default function CoachScreen({
         const days = cur2.days.map((d) =>
           d.weekday === fromArg ? place(d, t) : d.weekday === toArg ? place(d, f) : d
         );
-        return { ...p, plan: { ...p.plan!, current: { ...cur2, days } } };
+        // Re-date the logged entries so each follows its content to the new slot.
+        // workoutLogs is keyed by entry.date, so a moved day's WorkoutEntry — found
+        // at its OLD weekday's date — must be re-bucketed at the NEW weekday's date,
+        // or check-off churn on the Plan tab will miss it and duplicate the entry.
+        // The two slots SWAP: `f`'s content lands on `toArg` and `t`'s on `fromArg`,
+        // so the entries cross (fromDate→toDate and toDate→fromDate). Compute both
+        // target dates from this PRE-swap state and apply both re-dates by entry id,
+        // so neither clobbers the other and the swap + re-dating persist atomically.
+        const start = cur2.startDate;
+        const fromDate = dateForWeekday(start, fromArg); // f's old date / t's new date
+        const toDate = dateForWeekday(start, toArg); // t's old date / f's new date
+        let next: Profile = { ...p, plan: { ...p.plan!, current: { ...cur2, days } } };
+        if (f.loggedEntryId) next = redateWorkoutEntry(next, f.loggedEntryId, fromDate, toDate);
+        if (t.loggedEntryId) next = redateWorkoutEntry(next, t.loggedEntryId, toDate, fromDate);
+        return next;
       });
+      // Read the destination slot back from the ACTUAL saved profile and build an
+      // authoritative PLAN UPDATED card from real pre/post state.
+      const afterTo = nextProfile.plan?.current?.days.find((d) => d.weekday === toArg);
+      // Card fires ONLY on a material change at the destination slot. If the swap
+      // was a no-op (the two slots were already identical), push no card and tell
+      // the model the truth so its prose stays honest.
+      if (!planDayChanged(beforeTo, afterTo)) {
+        return `No change — ${WEEKDAY_LABELS[a.to]} already looks like that.`;
+      }
+      const diff = planDiff(beforeTo, afterTo!);
+      const card: CoachPlanChangeCard = {
+        kind: "plan_change",
+        dayLabel: `${WEEKDAY_LABELS[fromArg].toUpperCase()} → ${WEEKDAY_LABELS[toArg].toUpperCase()}`,
+        oldTitle: beforeTo?.title ?? "—",
+        newTitle: afterTo!.title,
+        ...diff,
+      };
+      turnCardsRef.current.push(card);
       return `Moved ${WEEKDAY_LABELS[a.from]}'s "${from.title}" to ${WEEKDAY_LABELS[a.to]} (and swapped what was on ${WEEKDAY_LABELS[a.to]} back to ${WEEKDAY_LABELS[a.from]}).`;
+    }
+    if (name === "shift_plan") {
+      const a = input as ShiftPlanArgs;
+      const cur = profileRef.current.plan?.current;
+      if (!cur) return "There's no active plan to shift.";
+      // Signed rotation: forward = +, back = −; default magnitude 1 when omitted
+      // or non-positive. Effective rotation collapses full-week multiples to 0.
+      const n = a.days && a.days > 0 ? a.days : 1;
+      const signedDays = (a.direction === "back" ? -1 : 1) * n;
+      const eff = ((signedDays % 7) + 7) % 7;
+      const dir = a.direction === "back" ? "back" : "forward";
+      if (eff === 0) {
+        return "No change — that shift lands the week right back where it is.";
+      }
+      // PRE-shift snapshot of the days (before any write) — used both to detect a
+      // materially-unchanged rotation (e.g. an all-rest week) and to compute the
+      // logged-entry re-date tuples. shiftWeekDays maps each DESTINATION weekday to
+      // the source `eff` slots earlier; mirror that here so a logged day's entry
+      // follows its content from its OLD date to its NEW date.
+      const beforeDays = cur.days;
+      const beforeByWeekday = new Map<Weekday, PlanDay>();
+      for (const d of beforeDays) beforeByWeekday.set(d.weekday, d);
+      // Compute the (entryId, fromDate, toDate) re-date tuples from the PRE-shift
+      // state FIRST, then apply them together inside the transform, so entries
+      // crossing dates can't clobber each other (same care as move_workout_day's
+      // both-logged case). For each SOURCE day that has a loggedEntryId: its content
+      // lands on destWd = (srcIdx + eff) % 7, so its entry moves from the source
+      // day's date to the destination day's date.
+      const redates: { id: string; from: string; to: string }[] = [];
+      WEEKDAYS.forEach((srcWd, srcIdx) => {
+        const src = beforeByWeekday.get(srcWd);
+        if (!src?.loggedEntryId) return;
+        const destWd = WEEKDAYS[(srcIdx + eff) % 7];
+        const fromDate = dateForWeekday(cur.startDate, srcWd);
+        const toDate = dateForWeekday(cur.startDate, destWd);
+        if (fromDate !== toDate) redates.push({ id: src.loggedEntryId, from: fromDate, to: toDate });
+      });
+      // ONE atomic transform: rotate the week's days AND re-date the logged entries
+      // off the pre-shift snapshot. Re-find the plan inside so a concurrent edit
+      // isn't clobbered; bail to the same rotated days if the plan vanished.
+      const nextProfile = await updateProfile((p) => {
+        const cur2 = p.plan?.current;
+        if (!cur2) return p;
+        const days = shiftWeekDays(cur2, signedDays);
+        let next: Profile = { ...p, plan: { ...p.plan!, current: { ...cur2, days } } };
+        for (const r of redates) next = redateWorkoutEntry(next, r.id, r.from, r.to);
+        return next;
+      });
+      // Materially-unchanged guard: a rotation of an all-identical / all-rest week
+      // changes nothing visible. Compare pre/post across the 7 slots via
+      // planDayChanged; if no slot's content differs, push no card and tell the
+      // model the truth so its prose stays honest.
+      const afterByWeekday = new Map<Weekday, PlanDay>();
+      for (const d of nextProfile.plan?.current?.days ?? []) afterByWeekday.set(d.weekday, d);
+      const materiallyChanged = WEEKDAYS.some((wd) =>
+        planDayChanged(beforeByWeekday.get(wd), afterByWeekday.get(wd))
+      );
+      if (!materiallyChanged) {
+        return `No change — shifting her week ${dir} ${n} day(s) lands it on the same workouts.`;
+      }
+      const card: CoachPlanShiftCard = { kind: "plan_shift", direction: dir, days: n };
+      turnCardsRef.current.push(card);
+      return `Shifted her whole week ${dir} ${n} day(s); every workout and her progress moved with it. It's on her Plan tab.`;
     }
     if (name === "remember_fact") {
       const a = input as RememberFactArgs;
@@ -644,6 +1128,43 @@ export default function CoachScreen({
       }));
       return `Updated her targets to ${next.calories} kcal, ${next.protein}g protein, ${next.carbs}g carbs, ${next.fat}g fat, ${next.fiber}g fiber. She can see and edit them in Settings.`;
     }
+    if (name === "suggest_meal") {
+      // Suggestion-only: build a SUGGESTED card for the chat. We do NOT write
+      // anything to the profile — a suggestion isn't consumed. The card carries
+      // the macro numbers + identity so "Save for later" can build a SavedFood.
+      const a = input as SuggestMealArgs;
+      const nm = (a.name ?? "").trim();
+      if (!nm) return "I couldn't catch the meal name — tell me what to suggest.";
+      const cal = Math.round(a.calories || 0);
+      const p = Math.round(a.protein || 0);
+      const c = Math.round(a.carbs || 0);
+      const f = Math.round(a.fat || 0);
+      const fib = typeof a.fiber === "number" ? Math.round(a.fiber) : undefined;
+      turnCardsRef.current.push({
+        kind: "suggested",
+        label: (a.label?.trim() || "meal").toUpperCase(),
+        name: nm,
+        calories: cal,
+        protein: p,
+        carbs: c,
+        fat: f,
+        fiber: fib,
+        quantityLabel: "1 serving",
+      });
+      return `Surfaced a meal suggestion card for "${nm}" (~${cal} kcal, ${p}g protein). It is NOT logged — she can save it for later if she wants.`;
+    }
+    if (name === "mark_bf_trend_surfaced") {
+      // Feature F2: stamp the marker so bodyCompTrendStatus's 14-day re-pester
+      // gate engages. No-arg tool — input is ignored. We intentionally do NOT
+      // gate on whether the trend was actually armed in this turn's context:
+      // if the model called this when it wasn't armed, the worst-case is the
+      // marker advances a few days early and the next genuine trend waits
+      // slightly longer to surface. Strictly safer than letting the model
+      // re-raise the same trend across multiple turns.
+      void (input as MarkBfTrendArgs);
+      await updateProfile((p) => ({ ...p, lastBfTrendSurfacedAt: new Date().toISOString() }));
+      return "Marked that you surfaced the body-composition trend — the 14-day gate is engaged so you won't bring it up again until then.";
+    }
     return `Unknown tool ${name}.`;
   };
 
@@ -653,10 +1174,27 @@ export default function CoachScreen({
     let active = true;
     loadChat().then(async (store) => {
       if (!active) return;
-      appendMessages(store.messages);
+      // PRIVACY MIGRATION: rewrite any old leaked error bubble (org UUID +
+      // console URLs from a 429) to the friendly line before it ever renders or
+      // is reused. Idempotent — already-friendly messages don't match the prefix,
+      // and scrubLeakedErrors returns the same array when nothing changed, so we
+      // only re-persist (with the continuity values just restored above) when an
+      // actual leak was scrubbed.
+      const scrubbed = scrubLeakedErrors(store.messages);
+      const didScrub = scrubbed !== store.messages;
+      store.messages = scrubbed;
       // Restore the conversation-continuity summary so it enriches the first turn.
       summaryRef.current = store.summary ?? "";
       summarizedCountRef.current = store.summarizedCount ?? 0;
+      appendMessages(scrubbed);
+      // Persist the cleaned history once, so the leaked text is gone from storage
+      // (not just this render). Only when something actually changed.
+      if (didScrub) {
+        await saveChat(scrubbed, {
+          summary: summaryRef.current,
+          summarizedCount: summarizedCountRef.current,
+        });
+      }
       const isNewDay = store.lastDate !== toISODate(new Date());
       const needKickoff = store.messages.length === 0 || isNewDay;
       if (!needKickoff) {
@@ -708,11 +1246,26 @@ export default function CoachScreen({
   }, []);
 
   const phase = currentPhase(profile);
-  const phaseLabel = phase.onBirthControl
-    ? "On birth control"
-    : phase.dayOfCycle
-      ? `${phase.phase} · day ${phase.dayOfCycle}`
-      : "Cycle not set";
+  // "" when cycle tracking is off — the header eyebrow is then hidden entirely
+  // (no phase, no day, no "cycle" wording at all).
+  const phaseLabel =
+    phase.phase === "off"
+      ? ""
+      : phase.onBirthControl
+        ? "On birth control"
+        : phase.dayOfCycle
+          ? `${phase.phase} · day ${phase.dayOfCycle}`
+          : "Cycle not set";
+
+  // Initials for the cocoa profile avatar (mockup top-right). Falls back to a
+  // bird glyph mark when there's no name. Presentation only.
+  const initials = (profile.name ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((w) => w[0]?.toUpperCase() ?? "")
+    .join("");
 
   // Append a user message, get the Coach's reply (which may log food/water/cycle
   // or read a photo via tools), and persist.
@@ -723,6 +1276,11 @@ export default function CoachScreen({
     const next: ChatMessage[] = [...messagesRef.current, userMsg];
     appendMessages(next);
     setSending(true);
+    // Fresh card accumulator for this turn — runTool pushes LOGGED/SUGGESTED
+    // cards into it as tool calls resolve; we read it back after askCoach returns
+    // and attach the cards to the assistant message. Reset here so cards never
+    // carry over from a previous turn.
+    turnCardsRef.current = [];
     // Deterministic crisis backstop: if the user's own words contain unambiguous
     // high-risk language, we ALWAYS surface support resources as an extra
     // assistant message, regardless of what the model returns (the model still
@@ -735,11 +1293,33 @@ export default function CoachScreen({
       : [];
     try {
       const reply = await askCoach(profileRef.current, next, runTool, summaryRef.current);
-      const withReply: ChatMessage[] = [
-        ...next,
-        { role: "assistant", content: reply, date: userMsg.date },
-        ...crisisMsg,
-      ];
+      // Attach any cards the tools produced this turn to the assistant message.
+      const turnCards = turnCardsRef.current;
+      // CONFABULATION GUARD (safety net): if the prose CLAIMS a plan/workout day
+      // was changed but NO plan_change card was produced this turn (no plan tool
+      // succeeded), append a short deterministic correction. We never rewrite or
+      // delete the model's text — only append one honest line. The matcher is
+      // sentence-scoped and excludes target/food context (see claimsPlanChange)
+      // so set_targets / food / advice turns that merely mention a workout don't
+      // trip it.
+      const claimedChange = claimsPlanChange(reply);
+      // A legit plan change this turn produced EITHER a single-day plan_change card
+      // (adjust/move) OR a whole-week plan_shift card. Count both, or a real
+      // shift_plan trips the confabulation false-positive.
+      const hasPlanCard = turnCards.some(
+        (c) => c.kind === "plan_change" || c.kind === "plan_shift"
+      );
+      const content =
+        claimedChange && !hasPlanCard
+          ? `${reply}\n\n(Heads up: I didn't actually change your plan just now.)`
+          : reply;
+      const assistantMsg: ChatMessage = {
+        role: "assistant",
+        content,
+        date: userMsg.date,
+        ...(turnCards.length ? { cards: turnCards } : {}),
+      };
+      const withReply: ChatMessage[] = [...next, assistantMsg, ...crisisMsg];
       appendMessages(withReply);
       await saveChat(withReply, {
         summary: summaryRef.current,
@@ -751,11 +1331,20 @@ export default function CoachScreen({
       void maybeSummarize();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
+      // PRIVACY: never surface (or persist) the raw error. Anthropic 429 bodies
+      // carry the org UUID, model name, and console/billing URLs — keep the raw
+      // text in the console for debugging only. The user sees a fixed friendly
+      // line; rate-limit (429 / "rate limit") gets its own gentler nudge.
+      console.log("[Coach] request failed:", msg);
+      const isRateLimited = /rate limit/i.test(msg) || /\b429\b/.test(msg);
+      const friendly = isRateLimited
+        ? "I'm a bit overloaded right now — try again in a minute."
+        : COACH_CONNECT_ERROR;
       const withErr: ChatMessage[] = [
         ...next,
         {
           role: "assistant",
-          content: `Something went wrong reaching the Coach: ${msg}. Check your API key and connection.`,
+          content: friendly,
           date: userMsg.date,
         },
         // Even if the Coach call fails, the deterministic support resources must
@@ -779,12 +1368,79 @@ export default function CoachScreen({
     deliver({ role: "user", content, date: toISODate(new Date()) });
   }
 
+  // Stable identity for a suggested card, matching how findSavedFood/saveFood
+  // dedupe (name+brand). Used to track + reflect the "Saved" pill state.
+  function cardKey(card: CoachFoodCard): string {
+    return (card.name + (card.brand ?? "")).trim().toLowerCase();
+  }
+
+  // Build the SavedFood for a suggested card, reusing lib/food.ts's toSavedFood
+  // (the same builder the Food tab uses) so the saved row carries the same shape
+  // and whole-gram rounding as every other saved food.
+  function savedFoodFromCard(card: CoachFoodCard): SavedFood {
+    return toSavedFood({
+      name: card.name,
+      brand: card.brand,
+      calories: card.calories,
+      protein: card.protein,
+      carbs: card.carbs,
+      fat: card.fat,
+      fiber: card.fiber,
+      quantityLabel: card.quantityLabel,
+    });
+  }
+
+  // Is this suggested card already in saved foods? Checks both the live profile
+  // (via findSavedFood — the single identity source) and this session's set, so
+  // the pill reflects "Saved" after a tap and across re-renders.
+  function isCardSaved(card: CoachFoodCard): boolean {
+    if (savedCardKeys.has(cardKey(card))) return true;
+    return !!findSavedFood(profile, savedFoodFromCard(card));
+  }
+
+  // SAVE FOR LATER: add the suggested meal to saved foods, reusing lib/food.ts's
+  // saveFood (the same add path the Food Edit-sheet's toggleSaveFood uses) and
+  // routing the profile write through the shared updateProfile (never a direct
+  // profile write in this screen). Idempotent — saveFood dedupes by name+brand.
+  async function handleSaveCard(card: CoachFoodCard) {
+    if (sending || booting) return;
+    const food = savedFoodFromCard(card);
+    if (findSavedFood(profile, food)) {
+      // Already saved — just reflect it and tell her where it lives.
+      setSavedCardKeys((prev) => new Set(prev).add(cardKey(card)));
+      Alert.alert("Already saved", `"${card.name}" is in your saved foods on the Food tab.`);
+      return;
+    }
+    try {
+      await updateProfile((p) => saveFood(p, food));
+      setSavedCardKeys((prev) => new Set(prev).add(cardKey(card)));
+      Alert.alert("Saved", `"${card.name}" is in your saved foods — find it on the Food tab.`);
+    } catch (e: unknown) {
+      Alert.alert("Couldn't save", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // SHOW MORE: ask the Coach for another option via the normal send path, so it
+  // can propose (and card) a fresh suggestion. Reuses send -> deliver unchanged.
+  function handleShowMore() {
+    send("Show me another option.");
+  }
+
   function addPhoto() {
     if (sending || booting) return;
     Alert.alert("Add food", "Snap your meal, a nutrition label, scan a barcode, or pick a photo.", [
       { text: "Take food photo", onPress: () => launchPhoto("camera", "meal") },
       { text: "Scan nutrition label", onPress: () => launchPhoto("camera", "label") },
-      { text: "Scan barcode", onPress: () => setScanning(true) },
+      {
+        text: "Scan barcode",
+        onPress: () => {
+          // Fresh scan session: release any leftover lock so a legitimate scan
+          // works after a previous one completed. The same-code debounce still
+          // prevents an immediate re-fire of the identical barcode.
+          scanBusyRef.current = false;
+          setScanning(true);
+        },
+      },
       { text: "Choose from library", onPress: () => launchPhoto("library", "auto") },
       { text: "Cancel", style: "cancel" },
     ]);
@@ -793,40 +1449,62 @@ export default function CoachScreen({
   // Scan a barcode in chat: look it up in OFF, then let the Coach log the exact
   // label numbers (and respond) — or say it isn't in the database.
   async function handleCoachScan(code: string) {
+    // SYNCHRONOUS RE-ENTRANCY LOCK — runs before any state update or await, so it
+    // blocks the burst of continuous-scan callbacks regardless of React timing.
+    // 1) a scan is already being processed → drop. 2) same code within ~2.5s →
+    // drop (debounce the identical barcode). Otherwise claim the lock + record it.
+    if (scanBusyRef.current) return;
+    const now = Date.now();
+    const last = lastScanRef.current;
+    if (last && last.code === code && now - last.t < 2500) return;
+    scanBusyRef.current = true;
+    lastScanRef.current = { code, t: now };
+
     setScanning(false);
     // Don't run while a Coach turn is mid-flight — a multi-step deliver() could
-    // still be appending its reply, and we'd race/overwrite it on save.
-    if (sending || booting) return;
-    let hit: FoodHit | null = null;
-    try {
-      hit = await lookupBarcode(code);
-    } catch {
-      hit = null;
-    }
-    if (!hit || !hit.per100g) {
-      const note: ChatMessage = {
-        role: "assistant",
-        content: `I couldn't find barcode ${code} in the food database. Tell me what it was and I'll log it, or add it on the Food tab.`,
-        date: toISODate(new Date()),
-      };
-      // Build on the latest list (ref), so a turn that resolved between the guard
-      // and here can't be clobbered when we persist.
-      const next: ChatMessage[] = [...messagesRef.current, note];
-      appendMessages(next);
-      await saveChat(next, {
-        summary: summaryRef.current,
-        summarizedCount: summarizedCountRef.current,
-      });
+    // still be appending its reply, and we'd race/overwrite it on save. Release
+    // the lock first so a later, legitimate scan isn't stuck behind a busy turn.
+    if (sending || booting) {
+      scanBusyRef.current = false;
       return;
     }
-    const grams = hit.serving?.grams ?? 100;
-    const m = scaleHit(hit, grams);
-    const label = hit.serving?.label || `${grams} g`;
-    deliver({
-      role: "user",
-      content: `I scanned ${hit.name}${hit.brand ? ` (${hit.brand})` : ""}. The label says about ${m.calories} cal, ${m.protein}g protein, ${m.carbs}g carbs, ${m.fat}g fat per ${label}. Log it for me (one serving unless I say otherwise).`,
-      date: toISODate(new Date()),
-    });
+    try {
+      let hit: FoodHit | null = null;
+      try {
+        hit = await lookupBarcode(code);
+      } catch {
+        hit = null;
+      }
+      if (!hit || !hit.per100g) {
+        const note: ChatMessage = {
+          role: "assistant",
+          content: `I couldn't find barcode ${code} in the food database. Tell me what it was and I'll log it, or add it on the Food tab.`,
+          date: toISODate(new Date()),
+        };
+        // Build on the latest list (ref), so a turn that resolved between the guard
+        // and here can't be clobbered when we persist.
+        const next: ChatMessage[] = [...messagesRef.current, note];
+        appendMessages(next);
+        await saveChat(next, {
+          summary: summaryRef.current,
+          summarizedCount: summarizedCountRef.current,
+        });
+        return;
+      }
+      const grams = hit.serving?.grams ?? 100;
+      const m = scaleHit(hit, grams);
+      const label = hit.serving?.label || `${grams} g`;
+      await deliver({
+        role: "user",
+        content: `I scanned ${hit.name}${hit.brand ? ` (${hit.brand})` : ""}. The label says about ${m.calories} cal, ${m.protein}g protein, ${m.carbs}g carbs, ${m.fat}g fat per ${label}. Log it for me (one serving unless I say otherwise).`,
+        date: toISODate(new Date()),
+      });
+    } finally {
+      // Release once the work (no-hit append OR full deliver turn) has settled, so
+      // a later scan after reopening the scanner still works. The same-code
+      // debounce above stops an immediate identical re-fire.
+      scanBusyRef.current = false;
+    }
   }
 
   async function launchPhoto(source: "camera" | "library", kind: "meal" | "label" | "auto" = "auto") {
@@ -867,46 +1545,89 @@ export default function CoachScreen({
     }
   }
 
-  function handleClear() {
-    // Same guard as the send/photo buttons: don't wipe history while a Coach
-    // turn is still resolving (its reply would land after the wipe).
+  // Clear the chat and reboot with a fresh kickoff greeting. The "Clear chat
+  // history" action lives in Settings now (it owns the destructive-confirm
+  // Alert), but the actual chat-state reset + reboot MUST run here in CoachScreen
+  // because this screen owns the messages/summary refs and the kickoff call.
+  // App bumps `clearSignal` after Settings clears storage; the effect below calls
+  // this. Storage was already cleared by the Settings handler, but we call
+  // clearChat() here too so this is idempotent and self-contained (a no-op
+  // second remove is harmless) and the in-memory state + reboot stay correct.
+  async function clearAndReboot() {
+    // Don't wipe/reboot while a Coach turn is still resolving — its reply would
+    // land after the wipe. The Settings action is async (post-confirm), so a turn
+    // could be mid-flight; re-check the same guard the send/photo buttons use.
     if (sending || booting) return;
-    Alert.alert(
-      "Clear chat?",
-      "This deletes your conversation history on this device. Your profile and targets stay.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Clear",
-          style: "destructive",
-          onPress: async () => {
-            // Re-check the guard: the alert is async, so a turn could have started
-            // (and be mid-flight) between tapping Clear and confirming it.
-            if (sending || booting) return;
-            await clearChat();
-            appendMessages([]);
-            // Reset the rolling summary too — the thread it summarized is gone.
-            summaryRef.current = "";
-            summarizedCountRef.current = 0;
-            setBooting(true);
-            try {
-              const reply = await coachKickoff(profile);
-              const fresh: ChatMessage[] = [
-                { role: "assistant", content: reply, date: toISODate(new Date()) },
-              ];
-              appendMessages(fresh);
-              // The thread was just cleared; the rolling summary is reset too.
-              await saveChat(fresh, { summary: "", summarizedCount: 0 });
-            } catch {
-              // ignore
-            } finally {
-              setBooting(false);
-            }
-          },
-        },
-      ]
-    );
+    await clearChat();
+    appendMessages([]);
+    // Reset the rolling summary too — the thread it summarized is gone.
+    summaryRef.current = "";
+    summarizedCountRef.current = 0;
+    setBooting(true);
+    try {
+      const reply = await coachKickoff(profileRef.current);
+      const fresh: ChatMessage[] = [
+        { role: "assistant", content: reply, date: toISODate(new Date()) },
+      ];
+      appendMessages(fresh);
+      // The thread was just cleared; the rolling summary is reset too.
+      await saveChat(fresh, { summary: "", summarizedCount: 0 });
+    } catch {
+      // ignore — she can still type even if the kickoff call failed
+    } finally {
+      setBooting(false);
+    }
   }
+
+  // Reboot when the user clears chat history from Settings. clearSignal starts at
+  // 0 (App's initial value) and bumps on each Settings-side clear; we skip the
+  // initial mount (the boot effect already handles first load) and only react to
+  // a genuine bump. Ref-guarded so the effect can't double-fire on an unrelated
+  // re-render. We intentionally don't depend on sending/booting: clearAndReboot
+  // re-checks that guard itself.
+  const lastClearSignalRef = useRef(clearSignal);
+  useEffect(() => {
+    if (clearSignal === lastClearSignalRef.current) return;
+    lastClearSignalRef.current = clearSignal;
+    void clearAndReboot();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clearSignal]);
+
+  // Day-specific Coach opener (Workout → "Or ask your Coach to adjust your plan"
+  // link). When a NEW adjustRequest.nonce arrives, APPEND a canned assistant
+  // question naming the tapped day, so the conversation is already anchored to
+  // it. Tracked via a last-seen-nonce ref so it fires exactly ONCE per tap (not
+  // on every render) and never on a normal Coach-tab open (null / unchanged
+  // nonce). This is a deterministic template — NO Anthropic call. We append
+  // (never replace) onto the latest list via messagesRef, then persist with
+  // saveChat exactly like the kickoff/scan paths, so existing history is kept
+  // and the rolling summary is unchanged. The onContentSizeChange auto-scroll
+  // reveals it. Her reply then flows through the normal askCoach turn (full
+  // system prompt + ED-safety + tools + plan context — none of which this
+  // bypasses). Seed the ref with the current nonce so a request that's already
+  // present at mount doesn't fire on first render.
+  const lastAdjustNonceRef = useRef(adjustRequest?.nonce);
+  useEffect(() => {
+    const nonce = adjustRequest?.nonce;
+    if (nonce == null || nonce === lastAdjustNonceRef.current) return;
+    lastAdjustNonceRef.current = nonce;
+    // Don't inject mid-boot or mid-turn — the boot kickoff / an in-flight reply
+    // could land after us and a save could race. The tab is already routed; the
+    // opener can wait one render until those settle (then a re-tap re-fires it).
+    if (booting || sending) return;
+    const opener: ChatMessage = {
+      role: "assistant",
+      content: `What would you like to change about ${adjustRequest!.label}'s workout?`,
+      date: toISODate(new Date()),
+    };
+    const next: ChatMessage[] = [...messagesRef.current, opener];
+    appendMessages(next);
+    void saveChat(next, {
+      summary: summaryRef.current,
+      summarizedCount: summarizedCountRef.current,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adjustRequest?.nonce]);
 
   return (
     <KeyboardAvoidingView
@@ -916,17 +1637,32 @@ export default function CoachScreen({
     >
       <View style={styles.header}>
         <View>
-          <Text style={styles.headerTitle}>Coach</Text>
-          <Text style={styles.headerSub}>{phaseLabel}</Text>
+          {phaseLabel ? (
+            <Text style={styles.eyebrow} numberOfLines={1}>
+              {phaseLabel.toUpperCase()}
+            </Text>
+          ) : null}
+          <Text style={styles.headerTitle}>coach</Text>
         </View>
-        <View style={styles.headerLinks}>
-          <TouchableOpacity onPress={handleClear} disabled={sending || booting}>
-            <Text style={styles.headerLink}>Clear</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={onOpenSettings}>
-            <Text style={styles.headerLink}>Settings</Text>
-          </TouchableOpacity>
-        </View>
+        {/* The mockup gives only a single profile avatar top-right. It maps to
+            Settings (the profile target). "Clear chat history" now lives inside
+            Settings (with its destructive confirm); clearing there reboots the
+            Coach via the clearSignal prop. */}
+        <TouchableOpacity
+          style={styles.profileAvatar}
+          onPress={onOpenSettings}
+          accessibilityLabel="Profile and settings"
+        >
+          {profile.profilePhotoUri ? (
+            <Image
+              source={{ uri: profile.profilePhotoUri }}
+              style={styles.profileImage}
+              resizeMode="cover"
+            />
+          ) : (
+            <Text style={styles.profileInitials}>{initials || "🐦"}</Text>
+          )}
+        </TouchableOpacity>
       </View>
 
       <ScrollView
@@ -934,14 +1670,10 @@ export default function CoachScreen({
         style={styles.flex}
         contentContainerStyle={styles.messages}
         keyboardDismissMode="on-drag"
-        onScroll={updateAtBottom}
-        scrollEventThrottle={16}
         onContentSizeChange={() => {
           // New content (a reply, the kickoff, a cleared+rebooted chat) auto-
-          // scrolls to the end, so we're back at the bottom — assert it here
-          // since the programmatic scroll may not emit onScroll.
+          // scrolls to the end so the newest bubble stays visible.
           scrollRef.current?.scrollToEnd({ animated: true });
-          setAtBottom(true);
         }}
       >
         {booting && <TypingDots />}
@@ -954,67 +1686,204 @@ export default function CoachScreen({
         {messages.map((m, i) => {
           const prev = messages[i - 1];
           const showDivider = !!m.date && m.date !== prev?.date;
+          const isUser = m.role === "user";
+          // Show the "wren" name-chip + WREN COACH label row at the START of a
+          // coach turn (first assistant message in a run, or right after a
+          // divider) — matching the mockup, where consecutive coach bubbles
+          // don't repeat the chip. User turns get a right-aligned "YOU" label.
+          const startsCoachRun = !isUser && (prev?.role !== "assistant" || showDivider);
+          const startsUserRun = isUser && (prev?.role !== "user" || showDivider);
           return (
             <Fragment key={i}>
-              {showDivider && <Text style={styles.divider}>{formatDayLabel(m.date!)}</Text>}
-              <View
-                style={[styles.bubble, m.role === "user" ? styles.userBubble : styles.coachBubble]}
-              >
-                {m.imageUri ? (
-                  <Image source={{ uri: m.imageUri }} style={styles.bubbleImage} resizeMode="cover" />
-                ) : null}
-                {m.content ? (
-                  <Text style={m.role === "user" ? styles.userText : styles.coachText}>
-                    {m.content}
-                  </Text>
-                ) : null}
+              {showDivider && <Text style={styles.divider}>{formatDayLabel(m.date!).toUpperCase()}</Text>}
+              {startsCoachRun && (
+                <View style={styles.coachLabelRow}>
+                  <View style={styles.nameChip}>
+                    <Text style={styles.nameChipText}>wren</Text>
+                  </View>
+                  <Text style={styles.coachLabel}>WREN COACH</Text>
+                </View>
+              )}
+              {startsUserRun && <Text style={styles.userLabel}>YOU</Text>}
+              {/* Full-width row wrapper: gives the bubble a DEFINITE parent width
+                  so its maxWidth:"82%" resolves and long text wraps. Alignment
+                  (left for coach, right for user) lives on the row, not on the
+                  bubble — using alignSelf on the bubble made it size to its own
+                  content and let long lines run past the screen edge. */}
+              <View style={[styles.bubbleRow, isUser ? styles.bubbleRowUser : styles.bubbleRowCoach]}>
+                <View
+                  style={[styles.bubble, isUser ? styles.userBubble : styles.coachBubble]}
+                >
+                  {m.imageUri ? (
+                    <Image source={{ uri: m.imageUri }} style={styles.bubbleImage} resizeMode="cover" />
+                  ) : null}
+                  {m.content ? (
+                    <Text style={isUser ? styles.userText : styles.coachText}>
+                      {/* Sanitize asterisk/bullet markdown out of COACH text only;
+                          never mutate what the user typed. Applied at render so it
+                          also cleans asterisks already stored in chat history. */}
+                      {isUser ? m.content : stripChatFormatting(m.content)}
+                    </Text>
+                  ) : null}
+                </View>
               </View>
+              {/* Editorial data cards attached to this assistant message: full-
+                  width, cocoa hairline top+bottom, no bubble. Suggested cards get
+                  the Save / Show-more pill pair beneath them. */}
+              {!isUser && m.cards?.length
+                ? m.cards.map((card, ci) => {
+                    // CONFABULATION GUARD card: an authoritative "PLAN UPDATED"
+                    // summary built in code from the real post-write profile.
+                    // Styled like the LOGGED food card (same hairline rail), but
+                    // its right column shows the exercise diff instead of macros.
+                    // Display-only — no Save/Undo pills (Undo is a later stage).
+                    if (card.kind === "plan_change") {
+                      const diffParts: string[] = [];
+                      if (card.added) diffParts.push(`+${card.added}`);
+                      if (card.removed) diffParts.push(`−${card.removed}`);
+                      if (card.kept) diffParts.push(`${card.kept} kept`);
+                      const diffLine = diffParts.length
+                        ? diffParts.join(" · ")
+                        : "no exercise change";
+                      return (
+                        <Fragment key={`card-${i}-${ci}`}>
+                          <View style={styles.dataCard}>
+                            <View style={styles.dataCardLeft}>
+                              <Text style={styles.dataCardSlot}>
+                                {`PLAN UPDATED · ${card.dayLabel}`}
+                              </Text>
+                              <Text style={styles.dataCardName}>
+                                {card.oldTitle === card.newTitle
+                                  ? card.newTitle
+                                  : `${card.oldTitle} → ${card.newTitle}`}
+                              </Text>
+                            </View>
+                            <View style={styles.dataCardRight}>
+                              <Text style={styles.dataCardMacros}>{diffLine}</Text>
+                              {!card.completionPreserved && (
+                                <Text style={styles.dataCardMacros}>completion reset</Text>
+                              )}
+                            </View>
+                          </View>
+                        </Fragment>
+                      );
+                    }
+                    // PLAN SHIFTED card: whole-week rotation summary (shift_plan).
+                    // Same hairline rail as the other plan/data cards; left column
+                    // is the header, right column the magnitude line.
+                    if (card.kind === "plan_shift") {
+                      return (
+                        <Fragment key={`card-${i}-${ci}`}>
+                          <View style={styles.dataCard}>
+                            <View style={styles.dataCardLeft}>
+                              <Text style={styles.dataCardSlot}>PLAN SHIFTED</Text>
+                              <Text style={styles.dataCardName}>
+                                {`Everything moved ${card.direction} ${card.days} day${
+                                  card.days > 1 ? "s" : ""
+                                }`}
+                              </Text>
+                            </View>
+                          </View>
+                        </Fragment>
+                      );
+                    }
+                    const macroLine = `${card.protein}p · ${card.carbs}c · ${card.fat}f${
+                      typeof card.fiber === "number" ? ` · ${card.fiber}fb` : ""
+                    }`;
+                    const slot =
+                      card.kind === "logged"
+                        ? `LOGGED · ${card.label}`
+                        : `SUGGESTED · ${card.label}`;
+                    const saved = card.kind === "suggested" && isCardSaved(card);
+                    return (
+                      <Fragment key={`card-${i}-${ci}`}>
+                        <View style={styles.dataCard}>
+                          <View style={styles.dataCardLeft}>
+                            <Text style={styles.dataCardSlot}>{slot}</Text>
+                            <Text style={styles.dataCardName}>{card.name}</Text>
+                          </View>
+                          <View style={styles.dataCardRight}>
+                            <Text style={styles.dataCardCals}>{card.calories}</Text>
+                            <Text style={styles.dataCardMacros}>{macroLine}</Text>
+                          </View>
+                        </View>
+                        {card.kind === "suggested" && (
+                          <View style={styles.ctaRow}>
+                            <TouchableOpacity
+                              style={[styles.ctaPill, styles.ctaPillFill, saved && styles.ctaPillSaved]}
+                              onPress={() => void handleSaveCard(card)}
+                              disabled={sending || booting}
+                            >
+                              <Text style={styles.ctaPillFillText}>
+                                {saved ? "SAVED" : "SAVE FOR LATER"}
+                              </Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={[styles.ctaPill, styles.ctaPillOutline]}
+                              onPress={handleShowMore}
+                              disabled={sending || booting}
+                            >
+                              <Text style={styles.ctaPillOutlineText}>SHOW MORE</Text>
+                            </TouchableOpacity>
+                          </View>
+                        )}
+                      </Fragment>
+                    );
+                  })
+                : null}
             </Fragment>
           );
         })}
         {sending && <TypingDots />}
+        {/* Suggested prompts live as the LAST item in the scroll flow (right
+            after the Coach's kickoff greeting) so they scroll with the chat
+            instead of being pinned above the composer. */}
+        {showSuggestions && (
+          <View style={styles.suggestList}>
+            <Text style={styles.suggestEyebrow}>OR ASK ME</Text>
+            {SUGGESTED.map((s) => (
+              <TouchableOpacity
+                key={s}
+                style={styles.suggestItem}
+                onPress={() => send(s)}
+                disabled={sending || booting}
+              >
+                <ArrowRightIcon size={14} />
+                <Text style={styles.suggestText}>{s}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
       </ScrollView>
 
-      {!inputFocused && atBottom && (
-        <View style={styles.suggestRow}>
-          {SUGGESTED.map((s) => (
-            <TouchableOpacity
-              key={s}
-              style={styles.chip}
-              onPress={() => send(s)}
-              disabled={sending || booting}
-            >
-              <Text style={styles.chipText}>{s}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      )}
-
       <View style={styles.inputRow}>
-        <TouchableOpacity
-          style={styles.photoBtn}
-          onPress={addPhoto}
-          disabled={sending || booting}
-        >
-          <Text style={styles.photoBtnIcon}>📷</Text>
-        </TouchableOpacity>
-        <TextInput
-          style={styles.input}
-          value={input}
-          onChangeText={setInput}
-          placeholder="Message your Coach…"
-          onFocus={() => setInputFocused(true)}
-          onBlur={() => setInputFocused(false)}
-          onSubmitEditing={() => send(input)}
-          returnKeyType="send"
-        />
-        <TouchableOpacity
-          style={styles.sendBtn}
-          onPress={() => send(input)}
-          disabled={sending || booting}
-        >
-          <Text style={styles.sendBtnText}>Send</Text>
-        </TouchableOpacity>
+        <View style={styles.inputBar}>
+          <TouchableOpacity
+            style={styles.photoBtn}
+            onPress={addPhoto}
+            disabled={sending || booting}
+            accessibilityLabel="Add a food photo, label, or barcode"
+          >
+            <CameraIcon size={20} />
+          </TouchableOpacity>
+          <TextInput
+            style={styles.input}
+            value={input}
+            onChangeText={setInput}
+            placeholder="Message your coach…"
+            placeholderTextColor={colors.inkMuted}
+            onSubmitEditing={() => send(input)}
+            returnKeyType="send"
+          />
+          <TouchableOpacity
+            style={styles.sendBtn}
+            onPress={() => send(input)}
+            disabled={sending || booting}
+            accessibilityLabel="Send"
+          >
+            <SendArrowIcon size={24} />
+          </TouchableOpacity>
+        </View>
       </View>
 
       <Modal visible={scanning} animationType="slide" onRequestClose={() => setScanning(false)}>
@@ -1025,88 +1894,319 @@ export default function CoachScreen({
 }
 
 const styles = StyleSheet.create({
-  flex: { flex: 1 },
+  flex: { flex: 1, backgroundColor: colors.paper },
+  // Header: eyebrow phase line over the lowercase "coach" wordmark; cocoa
+  // profile avatar top-right. No bottom hairline in the mockup.
   header: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-end",
     justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: "#eee",
+    paddingHorizontal: spacing["2xl"],
+    paddingTop: spacing.md,
+    paddingBottom: spacing.sm,
   },
-  headerTitle: { fontSize: 20, fontWeight: "700" },
-  headerSub: { fontSize: 13, color: "#7c3aed", marginTop: 2, textTransform: "capitalize" },
-  headerLinks: { flexDirection: "row", gap: 18 },
-  headerLink: { fontSize: 15, color: "#7c3aed", fontWeight: "600" },
-  messages: { padding: 16, paddingBottom: 8 },
-  empty: { color: "#666", fontSize: 15, lineHeight: 22, marginTop: 8 },
-  divider: {
-    alignSelf: "center",
-    color: "#999",
-    fontSize: 12,
-    fontWeight: "600",
-    marginVertical: 12,
+  // Eyebrow phase line — micro, wide tracking, clay. (Mockup is 9px/2.5px; the
+  // micro token + wide tracking is the brand-consistent rendering of it.)
+  eyebrow: {
+    fontFamily: type.ui.family,
+    fontSize: type.size.micro,
+    letterSpacing: type.tracking.wide,
+    color: colors.inkMuted,
   },
-  // Typing-dots indicator: a compact assistant bubble (matches coachBubble bg/
-  // radius/alignment) with three dots in a row. Slightly tighter vertical
-  // padding than a real message bubble so it reads as "composing", not a reply.
-  typingBubble: { paddingVertical: 12, paddingHorizontal: 14 },
-  typingRow: { flexDirection: "row", alignItems: "center", gap: 6 },
-  typingDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: "#999" },
-  bubbleImage: { width: 200, height: 200, borderRadius: 12, marginBottom: 6 },
-  photoBtn: {
+  // Lowercase "coach" wordmark — large bold, tight negative tracking, cocoa.
+  headerTitle: {
+    fontFamily: type.display.family,
+    fontSize: 38,
+    lineHeight: 40,
+    letterSpacing: -1.5,
+    color: colors.ink,
+    marginTop: spacing.xs,
+  },
+  profileAvatar: {
+    marginBottom: spacing.xs,
     width: 42,
     height: 42,
-    borderRadius: 21,
-    backgroundColor: "#f0eef7",
+    borderRadius: radius.pill,
+    backgroundColor: colors.ink,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden", // clips the profile photo to the pill circle
+  },
+  // Profile photo fills the 42px circle (cover). Falls back to initials + 🐦.
+  profileImage: {
+    width: 42,
+    height: 42,
+  },
+  profileInitials: {
+    fontFamily: type.display.family,
+    fontSize: type.size.callout,
+    letterSpacing: -0.3,
+    color: colors.surface,
+  },
+  messages: { paddingHorizontal: spacing.lg, paddingTop: spacing["2xl"], paddingBottom: spacing.sm },
+  empty: {
+    fontFamily: type.body.family,
+    color: colors.inkMuted,
+    fontSize: type.size.body,
+    lineHeight: 22,
+    marginTop: spacing.sm,
+  },
+  // TODAY / YESTERDAY day divider — centered micro label, mist-dark, wide track.
+  divider: {
+    alignSelf: "center",
+    fontFamily: type.label.family,
+    color: colors.inkMuted,
+    fontSize: type.size.micro,
+    letterSpacing: type.tracking.wide,
+    marginVertical: spacing.md,
+  },
+  // Coach turn header row: "wren" name-chip + WREN COACH label.
+  coachLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+    paddingLeft: spacing.xs,
+  },
+  nameChip: {
+    backgroundColor: colors.surfaceMuted,
+    paddingHorizontal: 10,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.pill,
+  },
+  nameChipText: {
+    fontFamily: type.display.family,
+    fontSize: type.size.micro,
+    letterSpacing: -0.3,
+    color: colors.ink,
+  },
+  coachLabel: {
+    fontFamily: type.label.family,
+    fontSize: type.size.micro,
+    letterSpacing: type.tracking.wide,
+    color: colors.mistDark,
+  },
+  // YOU label above a user turn — right-aligned, clay.
+  userLabel: {
+    alignSelf: "flex-end",
+    fontFamily: type.label.family,
+    fontSize: type.size.micro,
+    letterSpacing: type.tracking.wide,
+    color: colors.inkMuted,
+    marginBottom: spacing.xs,
+    paddingRight: spacing.xs,
+  },
+  // Typing-dots indicator: a compact coach bubble with three dots in a row.
+  typingBubble: { paddingVertical: spacing.md, paddingHorizontal: spacing.lg },
+  typingRow: { flexDirection: "row", alignItems: "center", gap: spacing.xs + 2 },
+  typingDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: colors.inkMuted },
+  bubbleImage: { width: 200, height: 200, borderRadius: radius.md, marginBottom: spacing.xs + 2 },
+  photoBtn: {
+    width: 40,
+    height: 40,
     alignItems: "center",
     justifyContent: "center",
   },
-  photoBtnIcon: { fontSize: 20 },
+  // Each mapped message bubble sits in a full-width row so the bubble's
+  // maxWidth:"82%" has a definite parent width to resolve against (the screen),
+  // which is what makes long text wrap instead of running off the right edge.
+  // justifyContent drives left/right placement.
+  bubbleRow: { width: "100%", flexDirection: "row" },
+  bubbleRowCoach: { justifyContent: "flex-start" },
+  bubbleRowUser: { justifyContent: "flex-end" },
   bubble: {
-    maxWidth: "85%",
-    borderRadius: 16,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginBottom: 10,
+    maxWidth: "82%",
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    marginBottom: spacing.xl + 2,
+    // Soft editorial lift — the app's shared soft-card recipe (WorkoutScreen
+    // cards): a faint cocoa shadow so the bubble floats off the cream
+    // background. Both bubble fills are opaque and neither bubble clips with
+    // overflow:"hidden", so the shadow renders on iOS. Applied to the shared
+    // base so coach, user, and the typing bubble all lift consistently.
+    shadowColor: colors.ink,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 5,
+    elevation: 2,
   },
-  userBubble: { alignSelf: "flex-end", backgroundColor: "#7c3aed" },
-  coachBubble: { alignSelf: "flex-start", backgroundColor: "#f0eef7" },
-  userText: { color: "#fff", fontSize: 16, lineHeight: 22 },
-  coachText: { color: "#1a1a1a", fontSize: 16, lineHeight: 22 },
-  suggestRow: {
+  // Asymmetric bubble corners per mockup: coach tucks bottom-left, user
+  // tucks bottom-right (20 elsewhere, 6 on the tucked corner).
+  userBubble: {
+    alignSelf: "flex-end",
+    backgroundColor: colors.ink,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderBottomRightRadius: 6,
+    borderBottomLeftRadius: 20,
+    // A cocoa shadow under the cocoa user bubble is naturally faint; nudge the
+    // offset/opacity up a touch so it still reads as lifted without going heavy.
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.16,
+    elevation: 3,
+  },
+  coachBubble: {
+    alignSelf: "flex-start",
+    backgroundColor: colors.surfaceMuted,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderBottomRightRadius: 20,
+    borderBottomLeftRadius: 6,
+  },
+  userText: { fontFamily: type.body.family, color: colors.surface, fontSize: 15, lineHeight: 22 },
+  coachText: { fontFamily: type.body.family, color: colors.ink, fontSize: 15, lineHeight: 22 },
+  // Editorial data card (LOGGED / SUGGESTED): full-width, warm cocoa hairline
+  // top+bottom, no bubble fill. Left = slot label + name; right = calories + the
+  // macro line, right-aligned (per mockup lines ~72-82 / ~108-118).
+  dataCard: {
     flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingBottom: 6,
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: spacing.md + 2,
+    paddingHorizontal: spacing.xs + 2,
+    marginBottom: spacing.lg + 2,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.cardHairline,
   },
-  chip: { backgroundColor: "#f0eef7", borderRadius: 16, paddingHorizontal: 12, paddingVertical: 7 },
-  chipText: { color: "#7c3aed", fontSize: 13, fontWeight: "600" },
-  inputRow: {
+  dataCardLeft: { flexShrink: 1, paddingRight: spacing.md },
+  dataCardRight: { alignItems: "flex-end" },
+  dataCardSlot: {
+    fontFamily: type.label.family,
+    fontSize: type.size.nano,
+    letterSpacing: type.tracking.label,
+    color: colors.mistDark,
+  },
+  dataCardName: {
+    fontFamily: type.ui.family,
+    fontSize: type.size.body,
+    color: colors.ink,
+    marginTop: spacing.xs + 1,
+  },
+  dataCardCals: {
+    fontFamily: type.label.family,
+    fontSize: 22,
+    // lineHeight 22 == fontSize gave the line box zero headroom, clipping the
+    // tops of the digits ("220"). Bump to 28 so the glyphs render fully.
+    lineHeight: 28,
+    letterSpacing: type.tracking.tight,
+    color: colors.ink,
+  },
+  dataCardMacros: {
+    fontFamily: type.body.family,
+    fontSize: type.size.micro,
+    color: colors.inkMuted,
+    marginTop: spacing.xs,
+  },
+  // CTA pill pair under a SUGGESTED card. Both pills established on Food:
+  // primary = Espresso (ink) fill / surface text; secondary = Espresso outline.
+  ctaRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginBottom: spacing.lg + 2,
+    paddingHorizontal: spacing.xs + 2,
+  },
+  ctaPill: {
+    flex: 1,
+    paddingVertical: spacing.md + 2,
+    borderRadius: radius.pill,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  ctaPillFill: { backgroundColor: colors.ink },
+  ctaPillSaved: { backgroundColor: colors.inkMuted },
+  ctaPillFillText: {
+    fontFamily: type.label.family,
+    fontSize: type.size.caption,
+    letterSpacing: type.tracking.button,
+    color: colors.surface,
+  },
+  ctaPillOutline: {
+    borderWidth: 1.5,
+    borderColor: colors.ink,
+    backgroundColor: "transparent",
+    // 1.5px border vs the fill pill's borderless edge would make the outline
+    // pill 3px taller; trim its vertical padding by the border width so both
+    // pills match height (mockup uses 13px vs 14px padding for the same reason).
+    paddingVertical: spacing.md + 2 - 1.5,
+  },
+  ctaPillOutlineText: {
+    fontFamily: type.label.family,
+    fontSize: type.size.caption,
+    letterSpacing: type.tracking.button,
+    color: colors.ink,
+  },
+  // Suggested-prompt list: left-aligned vertical list above the input bar. An
+  // "OR ASK ME" eyebrow over three tappable rows; each row is a thin camel arrow
+  // glyph + the prompt in cocoa. No pill background — clean list on the white
+  // screen, per the mockup.
+  // Inline as the last item in the scroll flow: the ScrollView's
+  // contentContainer (styles.messages) already insets horizontally, so no
+  // horizontal padding here. marginTop spaces it from the last bubble.
+  suggestList: {
+    marginTop: spacing.lg,
+    paddingBottom: spacing.xs,
+  },
+  suggestEyebrow: {
+    fontFamily: type.label.family,
+    fontSize: type.size.micro,
+    letterSpacing: type.tracking.wide,
+    color: colors.inkMuted,
+    marginBottom: spacing.xs + 2,
+  },
+  suggestItem: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#eee",
+    gap: spacing.sm,
+    paddingVertical: spacing.xs + 1,
+  },
+  suggestText: {
+    fontFamily: type.ui.family,
+    fontSize: type.size.callout,
+    color: colors.ink,
+  },
+  // Input bar: rounded creamTile pill with a hairline border, camera at left,
+  // circular cocoa send button at right.
+  inputRow: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.md,
+  },
+  inputBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    minHeight: 52,
+    paddingLeft: spacing.lg,
+    paddingRight: spacing.xs + 2,
+    paddingVertical: spacing.xs + 2,
+    backgroundColor: colors.creamTile,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.divider,
+    borderRadius: radius.pill,
+    // Soft editorial lift — same shared soft-card family as the chat bubbles,
+    // nudged a touch more present since this is a pinned composer. Opaque
+    // creamTile fill, no overflow:"hidden", so the shadow renders on iOS and
+    // elevation on Android.
+    shadowColor: colors.ink,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    elevation: 3,
   },
   input: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: "#ddd",
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    fontSize: 16,
+    fontFamily: type.body.family,
+    fontSize: 15,
+    color: colors.ink,
+    paddingVertical: 0,
   },
   sendBtn: {
-    backgroundColor: "#7c3aed",
-    borderRadius: 20,
-    paddingHorizontal: 18,
-    paddingVertical: 11,
+    width: 44,
+    height: 44,
+    borderRadius: radius.pill,
+    backgroundColor: colors.ink,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  sendBtnText: { color: "#fff", fontWeight: "700", fontSize: 15 },
 });

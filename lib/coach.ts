@@ -17,9 +17,18 @@ import { currentPhase, toISODate, observedCycleLength, nextPredictedPeriod } fro
 import { computeTargets, targetsFloorCalories, recomputeMacrosFromCalories } from "./targets";
 import { consumedTotals, entriesFor, remaining, waterFor } from "./food";
 import { workoutsFor, workoutLabel, caloriesBurnedFor } from "./workouts";
-import { mondayOf, newId, targetForDate, planDayForDate } from "./plan";
+import {
+  newId,
+  targetForDate,
+  planDayForDate,
+  densifyWeek,
+  dateForWeekday,
+  dayExercises,
+} from "./plan";
 import { memoryLines } from "./memory";
 import { noticingsBlock } from "./patterns";
+import { bodyCompContextLines, bodyCompTrendStatus } from "./bodycomp";
+import { detectCrisisLanguage } from "./safety";
 // NOTE: lib/bodycomp.ts navyBodyFatPercent is computed by the CALLER
 // (OnboardingScreen) and passed in via CalibrationContext.navyBodyFatPercent —
 // we deliberately don't import the helper here to keep lib/coach.ts decoupled
@@ -28,9 +37,10 @@ import { noticingsBlock } from "./patterns";
 
 // --- Models ---
 // Haiku for routine chat (cheap), Sonnet for complex coaching + the opener.
-// OPUS is reserved for the ONE-OFF onboarding photo calibration call where
-// better visual reasoning meaningfully improves the body-fat / goal read; see
-// calibrateFromPhotos for the cost rationale.
+// OPUS is reserved for two high-value, low-frequency calls where its stronger
+// reasoning is worth the cost: (1) the one-off onboarding photo calibration
+// (better visual body-fat / goal read; see calibrateFromPhotos), and (2)
+// workout-plan generation (higher-quality programming; see generateWeekPlan).
 const HAIKU = "claude-haiku-4-5";
 const SONNET = "claude-sonnet-4-6";
 const OPUS = "claude-opus-4-7";
@@ -114,7 +124,7 @@ export const PROACTIVE_ED_SAFETY = `PROACTIVE NOTICING (when you bring something
 - Never shame her, never moralize food as "good/bad/clean/dirty," and never recommend a sub-floor calorie target or any restrictive/compensatory behavior. Those are the real lines; everything else is normal coaching.`;
 
 // Static persona + guardrails. Authoritative, human voice, decoupled safety.
-const SYSTEM_PROMPT = `You are the Flux Coach: an expert, real fitness and nutrition coach for women who train with their cycle. Many of your users are not gym or nutrition people. They came here for a guide who tells them what to do, not a chatbot that makes them figure it out.
+const SYSTEM_PROMPT = `You are the Wren Coach: an expert, real fitness and nutrition coach for women who train with their cycle. Many of your users are not gym or nutrition people. They came here for a guide who tells them what to do, not a chatbot that makes them figure it out.
 
 YOUR JOB: be the authority, without being pushy.
 - When she asks for guidance, take a clear point of view: give a direct answer, concrete numbers, and a plan. Lead with the answer, then a short why. Do not make her configure things herself.
@@ -133,8 +143,9 @@ VOICE: text like a real person, not a bot.
 
 MACROS, TARGETS, AND FOOD LOGGING:
 - Her daily targets are already calculated for you and given in the context (calories and protein, carbs, fat, fiber). Present those EXACT numbers. Never invent, recompute, or change them, and never let your tone change them. The targets are her GOAL for the day. Fiber is a tracked macro alongside protein/carbs/fat — present it the same way (a daily-habit number, not a hard cutoff).
-- Flux now logs her food. The context gives you her REAL logged food for today, the consumed totals, and what is remaining versus her goal. These totals are summed in code from her actual entries, so they are trustworthy. You MAY tell her how much she has eaten and how much she has left — but ONLY using the consumed and remaining numbers given in the context. Never invent a tally, never estimate consumed or remaining numbers beyond what the context provides. If nothing is logged, the context will say so; then say plainly she has not logged anything yet.
+- Wren now logs her food. The context gives you her REAL logged food for today, the consumed totals, and what is remaining versus her goal. These totals are summed in code from her actual entries, so they are trustworthy. You MAY tell her how much she has eaten and how much she has left — but ONLY using the consumed and remaining numbers given in the context. Never invent a tally, never estimate consumed or remaining numbers beyond what the context provides. If nothing is logged, the context will say so; then say plainly she has not logged anything yet.
 - When she tells you she ate or drank something that is not already in today's logged list, LOG IT FOR HER by calling the log_food tool (one call per food) or log_water tool. If she did not give exact numbers, estimate the macros from typical values for that food and portion — estimates are approximate, so say so briefly and naturally (for example "logged that, roughly 280 calories, tweak it if you weighed it"). Do not claim something is logged unless you actually called the tool, and do not double-log an item that is already in today's list.
+- When she CORRECTS a food that is ALREADY in today's logged list — a different portion or different macros ("that yogurt was 200 g not 150", "make it two servings", "the latte was a large") — call the edit_food tool to update that existing entry. Match it by name. When she changes the serving, pass the new quantity label AND the recomputed calories/macros for that new portion (scale them from the original). edit_food only edits an entry that already exists; it never creates one. If nothing in today's list matches, don't invent it — offer to add it with log_food. After editing, confirm the new portion and its numbers plainly.
 - PHOTOS: she can send two kinds.
   (a) A photo of a MEAL: identify each food, estimate its portion and macros, and log each with log_food.
   (b) A photo of a NUTRITION FACTS label / packaging: READ the printed numbers, do not estimate them. Use the per-serving calories/protein/carbs/fat as printed; figure out servings (if she said, use it; if not, assume 1 and say so), multiply, and log with log_food using the product name and a quantity label like "1 serving (40 g)".
@@ -143,15 +154,21 @@ MACROS, TARGETS, AND FOOD LOGGING:
 - If the context says targets are not available and she asks about them, tell her to add her age, height, and weight in Settings. Do not collect those stats in chat.
 - Frame the targets as a strong starting point she will tune by results and how she feels. They already respect a safe floor (never below her BMR).
 - You can update her macro targets via the set_targets tool when she asks. Accepts any subset of calories/protein/carbs/fat — if she only gives a calorie number, the app will auto-distribute the macros via the existing formula. NEVER set calories below her BMR floor via the tool — refuse and explain she can change it herself in Settings if she really wants. (She can override the floor directly in Settings; you can't, by your own rules.)
+- When you PROPOSE a specific meal to her (not food she already ate), you may ALSO call the suggest_meal tool in that same turn to surface it as a tidy card with the meal name and your estimated calories/macros, which she can save for later. This is optional and purely a display nicety — it does NOT log or change anything, your safety rules and the real numbers are unaffected, and you still write your normal conversational reply. Use it only for a concrete recommendation; never for something she already logged (use log_food for that).
 
-CYCLE AND DAILY CHECK-INS: speak about phases with confidence but stay honest that bodies vary. Use "many women find" and tie advice to how she actually feels and what she logs. Personalize over time. When today's check-in shows symptoms, energy, mood, or digestion, factor them into your food and training suggestions in a practical, food-first way (for example, many women find magnesium- and iron-rich foods or gentle movement help with cramps and fatigue; lighter, lower-sodium meals plus water can ease bloating; steady protein and complex carbs help with cravings and low energy). Keep it gentle and feel-based, never medical advice, never name specific supplements or doses.
+CYCLE AND DAILY CHECK-INS: speak about phases plainly and directly, and tie advice to how she actually feels and what she logs. State phase and energy patterns as the general patterns they are — flat and honest, not hedged and not framed as a guarantee about her specifically. Personalize over time. When today's check-in shows symptoms, energy, mood, or digestion, factor them into your food and training suggestions in a practical, food-first way (for example, magnesium- and iron-rich foods or gentle movement help with cramps and fatigue; lighter, lower-sodium meals plus water can ease bloating; steady protein and complex carbs help with cravings and low energy). Keep it gentle and feel-based, never medical advice, never name specific supplements or doses.
 - LOGGING HER CYCLE: when she tells you her period started or ended, or how she physically feels (cramps, bloating, energy, mood, digestion), record it with the log_checkin tool so her Cycle tab and phase stay current. Map her words to the fields (e.g. "my period started, kind of heavy" -> flow heavy; "so crampy and tired" -> symptoms cramps and fatigue, energy low). Confirm warmly and briefly, then give a feel-based tip; do not interrogate her for the other fields.
 
 WORKOUTS:
 - When she tells you she trained, log it with the log_workout tool. Lifting/strength -> kind "strength" with each exercise's name, sets, reps, and weight in lb (omit weight for bodyweight moves like push-ups). Cardio, a class, or a studio workout (Pilates, Lagree, boxing, yoga, spin, run, walk, hike) -> kind "activity" with the activity name and duration in minutes (and distance if she said one). For example "did 3 sets of 10 back squats at 95" -> strength; "45 minute lagree class" -> activity.
 - Only log what she actually told you — don't invent sets, weights, or durations. If a detail is missing and it matters, you may ask one short question, otherwise log what you have. Confirm briefly and don't double-log something already shown in today's workouts.
-- Tie training to her cycle phase gently and only when useful ("many women find they can push intensity in the follicular phase"). Never prescriptive, never medical.
-- DAILY FLEX: the context gives today's weekday + date and this week's plan by day. If she says she's wiped, sore, short on time, or asks what to do, decide whether to adjust — and if so, call adjust_workout_day for the RIGHT day. It defaults to today; if she means another day ("Monday", "tomorrow"), pass that weekday — read the context's day map and "tomorrow = next weekday" so you target the correct one. You can make a day lighter, shorter, swapped, or a recovery/rest day. Honor genuine fatigue and her cycle, but if backing off is becoming a pattern, be honest about what it costs her goal and offer the smallest real session instead of just resting. Confirm which day you changed and that it's on her Plan tab. To RESCHEDULE rather than change a workout ("move Monday's workout to Tuesday", "I'm busy Monday"), use move_workout_day with from/to weekdays instead.
+- Tie training to her cycle phase gently and only when useful, stated plainly as a general pattern ("the follicular phase is usually a good window to push intensity"). Never prescriptive, never medical.
+- DAILY FLEX: the context gives today's weekday + date and this week's plan by day. If she says she's wiped, sore, short on time, or asks what to do, decide whether to adjust — and if so, call adjust_workout_day for the RIGHT day. It defaults to today; if she means another day ("Monday", "tomorrow"), pass that weekday — read the context's day map and "tomorrow = next weekday" so you target the correct one. You can make a day lighter, shorter, swapped, or a recovery/rest day. Honor genuine fatigue and her cycle, but if backing off is becoming a pattern, be honest about what it costs her goal and offer the smallest real session instead of just resting. Confirm which day you changed and that it's on her Plan tab. To RESCHEDULE rather than change a workout ("move Monday's workout to Tuesday", "I'm busy Monday"), use move_workout_day with from/to weekdays instead. When you adjust a day, OMIT replace to tweak or add to it (her unmentioned exercises and checked-off progress are kept); set replace:true ONLY when she clearly wants the whole day rebuilt from scratch.
+- SINGLE-EXERCISE EDITS: the context lists each training day's REAL exercises with their current sets/reps/weight and the date that day falls on. When she wants to change ONE exercise ("bump my Romanian deadlift to 135", "make Tuesday's squats 3x8"), you CAN do it yourself — do NOT send her to the Plan tab. Find the right day from the dates, then call adjust_workout_day for that weekday passing ONLY that one exercise with its new value, and use the EXACT name shown in the context (don't paraphrase, or the merge adds a duplicate instead of updating it). OMIT replace so the rest of the day and her checked-off progress are kept.
+- REMOVING AND SWAPPING EXERCISES: to DELETE/remove an exercise ("delete the reverse lunge", "drop the calf raises"), call adjust_workout_day for that day with removeExercises: ["<exact name from context>"]. To SWAP one exercise for a DIFFERENT exercise ("change reverse lunge to walking lunge", "replace X with Y"), make ONE call that passes BOTH removeExercises: ["<old name>"] AND exercises: [{ name: "<new name>", ... }] — do NOT just add the new one, or both will remain on the day. This is DISTINCT from changing an exercise's weight or reps: a weight/rep change stays an exercises update using the SAME name with no removal (the merge updates it in place). Always use the EXACT exercise names shown in the context. OMIT replace so the rest of the day and her checked-off progress are kept.
+- SHIFT THE WHOLE WEEK: to move/push/shift her ENTIRE week (e.g. "move everything forward a day", "push my whole schedule back 2 days", "bump everything by 3"), call shift_plan with direction ("forward"/"back") and days — it rotates ALL her workouts at once and keeps her checked-off progress. This is DISTINCT from moving ONE day (move_workout_day) or editing one day (adjust_workout_day). For "rebuild my week" or "make me a new plan from scratch", do NOT use shift_plan and do NOT claim you rebuilt it — tell her to tap Regenerate on the Workout tab. You can shift, swap, and edit her week, but you don't build a brand-new week inline.
+- NEVER CLAIM A PLAN CHANGE YOU DID NOT MAKE: you may tell her a plan or workout day was changed, moved, pushed, shifted, rebuilt, swapped, rescheduled, or updated ONLY if you actually called a plan tool (adjust_workout_day, move_workout_day, or shift_plan) THIS SAME TURN and it succeeded. If you did not call a plan tool, do not say you did — instead say plainly what you can do and ask her, or just call the tool. The app shows her an authoritative card of exactly what changed, so your words must match that card: do not describe a change you could not make as if you made it, and do not "say done" without acting.
+- THE CONTEXT'S LOGGED LISTS ARE THE LIVE, AUTHORITATIVE STATE OF HER LOG — trust them over your own earlier turns: today's food log and "Workouts logged today" already reflect anything she deleted or edited in the app since earlier in this conversation. These lists cover TODAY only, so an item from a previous day dropping off is just the day changing — not a deletion. But if a food or workout you logged EARLIER TODAY in this chat no longer appears there, she deleted it — treat it as NOT logged: don't claim it's still logged, don't count it in any total, and don't re-log it unless she asks. If she asks about it, acknowledge plainly that it's no longer in her log; don't ask why she removed it.
 
 LONG-TERM MEMORY:
 - You have a small, durable memory of facts about her, shown in the context under "WHAT YOU REMEMBER ABOUT HER". It is separate from this conversation and always applies — use it to stay consistent and personal across days.
@@ -167,6 +184,15 @@ PROACTIVE / NOTICING:
 - If a noticing is an honest one (missed workouts piling up), be honest about it the way a good coach is — name it plainly and offer the smallest real step — but never nag, never shame. If it's a win (a strong streak), acknowledge it genuinely.
 - Do NOT repeat the same noticings on every message. After the opener, only bring a noticing up again if it's genuinely relevant to what she just said. The opener leads; the rest of the conversation responds to her.
 
+BODY-COMPOSITION TREND (Feature F2):
+- The context may include a "BODY-COMPOSITION TREND ARMED" block when a real DEXA / InBody / other scan has shown a trend that conflicts with her stated goal AND the gating conditions (≥8 weeks apart, not surfaced in the last 14 days) are met. When that block is present — AND ONLY THEN — raise it CONVERSATIONALLY in your next reply, once, and then call the mark_bf_trend_surfaced tool in the SAME turn so the app records you surfaced it (otherwise you'll keep re-raising it).
+- HOW to raise it: state the numbers plainly (latest BF%, previous BF%, weeks apart) and, when relevant to her goal, propose a SPECIFIC calorie delta of roughly 100-200 cal/day (lean conservative — 100-150 unless she's far from her goal). Briefly explain the math in plain words (e.g. "100 fewer a day is about a half pound of fat a month"). Then ASK if she wants you to make the change. Do NOT call set_targets until she says yes.
+- FACTUAL framing only: never editorialize the trend. Forbidden words/frames: "regressed", "gained fat", "off track", "concerning", "good job", "bad", "worried", "disappointed". Plain facts and a plain proposal.
+- BMR FLOOR: before proposing any calorie cut, check the context — it tells you her current target and her BMR floor. If your proposed cut would put her at or below the floor, REFUSE the cut and say so plainly ("your floor is X and you're already close to it — cutting further isn't safe; let's adjust training/protein instead"). If her targets are already CUSTOM and at or near the floor, do not propose a further cut at all.
+- IF SHE APPROVES: call set_targets with the new calorie target (the existing tool will auto-distribute the macros via the formula). Call mark_bf_trend_surfaced in the same turn so the marker advances. Confirm briefly. set_targets enforces the floor on its own; do not bypass.
+- IF SHE DECLINES OR DEFERS: acknowledge warmly and drop it ("no problem — we can revisit when you want"). Still call mark_bf_trend_surfaced so the 14-day gate engages and you don't re-raise it tomorrow.
+- DO NOT initiate this on your own when there's no ARMED block — the context's deterministic check is the ONLY trigger. Do not speculate about trends from photos, weight, or vibes.
+
 ${PROACTIVE_ED_SAFETY}
 
 ${ED_SAFETY_RULES}`;
@@ -178,19 +204,36 @@ ${ED_SAFETY_RULES}`;
 // leads the opener with noticings but cannot nag them on every reply. The system
 // prompt also instructs it not to re-list noticings; gating the block here is the
 // belt to that suspenders.
-function buildContextBlock(profile: Profile, forOpener = false, summary = ""): string {
+//
+// `crisisActive` suppresses the Feature F2 BODY-COMPOSITION TREND ARMED block
+// when the most recent user message tripped detectCrisisLanguage (see lib/safety
+// .ts). Per spec: "Coach does NOT initiate this trend conversation if her most
+// recent crisis-detector signal is hot." The deterministic backstop already
+// surfaces crisis resources separately; the F2 trend rule defers to it.
+function buildContextBlock(
+  profile: Profile,
+  forOpener = false,
+  summary = "",
+  crisisActive = false
+): string {
   const phase = currentPhase(profile);
   const obs = observedCycleLength(profile);
   const pred = nextPredictedPeriod(profile);
-  const cycleLine = phase.onBirthControl
-    ? "On hormonal birth control, no natural cycle to sync to."
-    : phase.dayOfCycle
-      ? `${phase.phase} phase (cycle day ${phase.dayOfCycle} of ~${obs.length}${
-          obs.fromHistory ? `, observed average from her logged history` : `, default prior`
-        })`
-      : "cycle phase unknown (no period logged yet)";
+  // When cycle tracking is OFF, the Coach must not reference her cycle at all.
+  // We replace the cycle line with an explicit instruction and suppress the
+  // prediction line entirely (cycleLine becomes the directive itself below).
+  const cycleOff = phase.phase === "off";
+  const cycleLine = cycleOff
+    ? "Cycle tracking is OFF for this user — do not mention or ask about her menstrual cycle, phase, or period."
+    : phase.onBirthControl
+      ? "On hormonal birth control, no natural cycle to sync to."
+      : phase.dayOfCycle
+        ? `${phase.phase} phase (cycle day ${phase.dayOfCycle} of ~${obs.length}${
+            obs.fromHistory ? `, observed average from her logged history` : `, default prior`
+          })`
+        : "cycle phase unknown (no period logged yet)";
   const predictionLine =
-    !phase.onBirthControl && pred
+    !cycleOff && !phase.onBirthControl && pred
       ? `Next period predicted around ${pred.date} (~${pred.daysUntil} days away). This is an estimate from her own logged history, not a fact — speak about it gently and never as medical or fertility advice.`
       : "";
 
@@ -227,10 +270,40 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
     { hour: "numeric", minute: "2-digit" }
   )}. "Today" means this weekday; "tomorrow" is the next one.`;
   const planWk = profile.plan?.current;
+  // Pass 2b: give the Coach VISIBILITY into the real plan — each day's actual ISO
+  // date (so it can map "today / tomorrow / Thursday" to the right weekday slot)
+  // and, for every TRAINING day, the actual exercises with their current values.
+  // This lets it edit a single exercise's weight/reps through the existing merge
+  // path (adjust_workout_day → mergePlanDay) using the EXACT name shown, instead
+  // of deflecting her to the Plan tab. Scope is bounded to plan days only — a week
+  // is a handful of training days, so this stays tight.
   const planWeekLine = planWk
-    ? `This week's plan (you can adjust ANY day with adjust_workout_day — pass its weekday; default is today): ${planWk.days
-        .map((d) => `${WEEKDAY_LABELS[d.weekday]}=${d.kind === "rest" ? "Rest" : d.title}`)
-        .join("; ")}.`
+    ? `This week's plan, by day, with the real date each weekday falls on and each training day's actual exercises and their CURRENT values. These are her REAL planned exercises — to change one exercise's weight or reps, call adjust_workout_day for that day passing ONLY that one exercise (the merge keeps everything else and her checked-off progress), and use the EXACT exercise name shown below (do not paraphrase it, or it gets added as a duplicate instead of updated). Use the dates to resolve "today/tomorrow/<weekday>" to the right day. You do NOT need to send her to the Plan tab for a weight change you can make yourself:\n${planWk.days
+        .map((d) => {
+          const dateISO = dateForWeekday(planWk.startDate, d.weekday);
+          const head = `${WEEKDAY_LABELS[d.weekday]} ${dateISO} = ${
+            d.kind === "rest" ? "Rest" : d.title
+          }`;
+          if (d.kind === "rest") return head;
+          const exs = dayExercises(d);
+          if (!exs.length) return head;
+          const lines = exs.map((e) => {
+            const setsReps =
+              e.sets != null && e.reps
+                ? `${e.sets}x${e.reps}`
+                : e.sets != null
+                  ? `${e.sets} sets`
+                  : e.reps
+                    ? e.reps
+                    : "";
+            const parts = [setsReps, e.weight != null ? `@ ${e.weight}lb` : ""]
+              .filter(Boolean)
+              .join(" ");
+            return `    - ${e.name}${parts ? ` — ${parts}` : ""}${e.done ? " [done]" : ""}`;
+          });
+          return `${head}\n${lines.join("\n")}`;
+        })
+        .join("\n")}`
     : "";
   const planDay = planDayForDate(profile, todayISO);
   // Target is cycled by today's plan intensity (rest/light/moderate/hard) if there's a plan.
@@ -301,6 +374,43 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
   // Deterministic "noticings" — only on the daily opener (see forOpener doc above).
   const noticing = forOpener ? noticingsBlock(profile, now) : "";
 
+  // Feature F2: factual body-composition log (latest + previous delta). Always
+  // included when she has any entries — the Coach reads it as context but the
+  // system prompt forbids editorializing it. No URIs, no images.
+  const bodyCompContext = bodyCompContextLines(profile);
+
+  // Feature F2: trigger the BF%-trend conversational suggestion ONLY when ALL
+  // conditions are met (see bodyCompTrendStatus). The ARMED block is the SOLE
+  // permission slip — the system prompt forbids initiating this on a hunch.
+  // Suppressed entirely when crisisActive (deferring to the safety surface) or
+  // on the daily opener (the opener leads with noticings, not the trend; the
+  // trend can fire on the next normal turn instead).
+  const trendStatus =
+    !crisisActive && !forOpener ? bodyCompTrendStatus(profile, todayISO) : { armed: false, reason: "" };
+  let trendArmedBlock = "";
+  if (trendStatus.armed && trendStatus.latest && trendStatus.previous) {
+    const lt = trendStatus.latest;
+    const pv = trendStatus.previous;
+    const floorLine = floor != null ? `Her BMR floor is ${floor} kcal.` : "Her BMR floor is unknown (missing age/height/weight).";
+    const targetLine = t
+      ? `Her current calorie target is ${t.calories} kcal${profile.customTargets ? " (custom)" : ""}.`
+      : "Her current calorie target is not set.";
+    trendArmedBlock = [
+      "BODY-COMPOSITION TREND ARMED (Feature F2 — raise this conversationally THIS TURN and call mark_bf_trend_surfaced; see the system prompt for the rules):",
+      `- Latest scan: ${lt.date} ${lt.source.toUpperCase()}, BF ${lt.bodyFatPct}%${
+        typeof lt.leanMassLbs === "number" ? `, lean ${lt.leanMassLbs} lb` : ""
+      }${typeof lt.muscleMassLbs === "number" ? `, muscle ${lt.muscleMassLbs} lb` : ""}.`,
+      `- Previous scan: ${pv.date} ${pv.source.toUpperCase()}, BF ${pv.bodyFatPct}%${
+        typeof pv.leanMassLbs === "number" ? `, lean ${pv.leanMassLbs} lb` : ""
+      }${typeof pv.muscleMassLbs === "number" ? `, muscle ${pv.muscleMassLbs} lb` : ""}.`,
+      `- About ${trendStatus.weeksBetween} weeks between them.`,
+      `- Why armed: ${trendStatus.reason}.`,
+      targetLine,
+      floorLine,
+      "Bring it up plainly, propose ~100-200 cal/day adjustment (conservative end) IF that respects the floor, and ask if she wants the change. If a cut would put her at/below the floor, refuse the cut and suggest training/protein adjustments instead.",
+    ].join("\n");
+  }
+
   // Conversation-continuity summary of older messages that scrolled out of the
   // verbatim window. Lives in this VOLATILE context block (not the cached system
   // prompt). Omitted entirely when empty so we never send a stray empty section.
@@ -331,6 +441,8 @@ function buildContextBlock(profile: Profile, forOpener = false, summary = ""): s
     "To add a food, water, workout, or cycle check-in she mentions that is not already shown above, call the matching log tool (log_food / log_water / log_workout / log_checkin). The conversation may span days; a message starting with [YYYY-MM-DD] marks that day. Never invent consumed or remaining numbers beyond those given here.",
     `Her preferences/rules: ${profile.dietaryRules || "none specified"}`,
     ...(memoryLines(profile) ? [memoryLines(profile)] : []),
+    ...(bodyCompContext ? [bodyCompContext] : []),
+    ...(trendArmedBlock ? [trendArmedBlock] : []),
     ...(noticing ? [noticing] : []),
     ...(summaryBlock ? [summaryBlock] : []),
     `Coaching tone to use: ${toneStyle}`,
@@ -386,6 +498,19 @@ export type LogFoodArgs = {
   fat?: number;
   fiber?: number;
 };
+// Edit an ALREADY-logged food's portion/macros. `name` locates the existing
+// entry (fuzzy, most-recent match in today's log); the handler NEVER creates a
+// new entry. When only `quantity` is given the handler rescales the entry's
+// macros via rescaleMacrosForQuantity; when macros are given they win.
+export type EditFoodArgs = {
+  name: string;
+  quantity?: string;
+  calories?: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
+  fiber?: number;
+};
 export type LogWaterArgs = { cups: number };
 export type LogCheckinArgs = {
   flow?: "spotting" | "light" | "medium" | "heavy" | "none";
@@ -409,6 +534,11 @@ export type LogWorkoutArgs = {
   date?: string;
 };
 export type MoveDayArgs = { from: Weekday; to: Weekday };
+// Rotate her ENTIRE week's workouts forward/back by N days in one call. A pure
+// rotation of the 7 weekday slots (see shiftWeekDays in lib/plan.ts) — distinct
+// from move_workout_day (which moves ONE day) and adjust_workout_day (edits one
+// day). `days` defaults to 1 when omitted or non-positive.
+export type ShiftPlanArgs = { direction: "forward" | "back"; days?: number };
 export type RememberFactArgs = { fact: string };
 export type ForgetFactArgs = { fact: string };
 // Set her macro override via chat. Any subset is accepted; the runTool handler
@@ -423,15 +553,51 @@ export type SetTargetsArgs = {
   fat?: number;
   fiber?: number;
 };
+// Feature F2: marker tool. The Coach calls this in the SAME turn it raises
+// the BF%-trend suggestion (whether the user approves, declines, or hasn't
+// answered yet) so the 14-day re-pester gate engages. There are no inputs —
+// the handler just stamps `profile.lastBfTrendSurfacedAt = now`. Kept as a
+// distinct tool from set_targets so the marker advances even when the user
+// declines the proposed adjustment (no set_targets call gets made). Typed as
+// Record<string, never> rather than `{}` to enforce "no fields" at the call
+// site.
+export type MarkBfTrendArgs = Record<string, never>;
+// Surface a meal SUGGESTION as an editorial card in the chat (see the Coach
+// mockup's SUGGESTED card + Save/Show-more pills). This NEVER logs anything —
+// a suggestion isn't consumed; the card just carries the macro numbers and
+// enough identity for the user to save it for later. The handler returns a
+// confirmation string the model reads back; the structured card is attached to
+// the assistant message client-side in CoachScreen.runTool. Macro fields mirror
+// log_food so the same estimate discipline applies.
+export type SuggestMealArgs = {
+  name: string;
+  label?: string; // editorial slot label, e.g. "LUNCH", "SNACK"; defaults to "MEAL"
+  calories: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
+  fiber?: number;
+};
 export type AdjustDayArgs = {
   weekday?: Weekday; // which day to change; defaults to today
   kind?: "strength" | "activity" | "rest";
-  title: string;
+  // Optional: the merge path keeps the existing title and the replace path defaults it,
+  // so a single-exercise tweak ("change Thursday's row to 20lb") needn't resend the title.
+  title?: string;
   intensity?: "rest" | "light" | "moderate" | "hard";
   durationMin?: number;
   activity?: string;
   exercises?: { name: string; sets?: number; reps?: string; weight?: number; note?: string }[];
+  // Names of existing exercises to REMOVE from the day. Used to delete an
+  // exercise, or — together with `exercises` — to SWAP one for another (remove
+  // old + add new in a single call). Matched against the day's CURRENT exercises
+  // with the same precision as updates; an unmatched name is a safe no-op.
+  removeExercises?: string[];
   note?: string;
+  // Omit (default false) to MERGE the patch into the existing day — unmentioned
+  // exercises and completion survive. Set true ONLY to rebuild the day from
+  // scratch (full replace), discarding what's there.
+  replace?: boolean;
 };
 
 // Runs a tool call against the local store; returns a short result string the
@@ -455,6 +621,24 @@ const FOOD_TOOLS = [
         fiber: { type: "number", description: "Grams of dietary fiber. Omit if you don't have a sensible estimate." },
       },
       required: ["name", "calories"],
+    },
+  },
+  {
+    name: "edit_food",
+    description:
+      "Change an ALREADY-LOGGED food in today's diary — use when she corrects the portion or macros of something already in today's logged list (e.g. 'that yogurt was 200 g not 150 g', 'make the latte a large', 'the chicken was actually two servings'). Find the entry by name (closest match in today's logged foods). When she changes the SERVING, pass the new `quantity` label AND the recomputed calories/protein/carbs/fat (and fiber if known) for that new portion, scaled from the original. This ONLY edits an entry that already exists; it never creates one. If nothing in today's log matches the name, do NOT use this — offer to add it with log_food instead.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Name of the already-logged food to edit (closest match in today's log)." },
+        quantity: { type: "string", description: "New portion label, e.g. '200 g', '1 large', '2 servings'." },
+        calories: { type: "number", description: "New calories for the new portion." },
+        protein: { type: "number", description: "New grams of protein for the new portion." },
+        carbs: { type: "number", description: "New grams of carbohydrate for the new portion." },
+        fat: { type: "number", description: "New grams of fat for the new portion." },
+        fiber: { type: "number", description: "New grams of dietary fiber. Omit if unknown." },
+      },
+      required: ["name"],
     },
   },
   {
@@ -571,9 +755,20 @@ const FOOD_TOOLS = [
             required: ["name"],
           },
         },
+        removeExercises: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Names of exercises to REMOVE from the day. Use to delete an exercise, or — together with `exercises` — to SWAP one exercise for another. Use the EXACT name shown in the context.",
+        },
         note: { type: "string" },
+        replace: {
+          type: "boolean",
+          description:
+            "Omit to tweak/add to the day (merge: unmentioned exercises and her checked-off progress are kept). Set true ONLY when she clearly wants the whole day rebuilt from scratch.",
+        },
       },
-      required: ["title"],
+      required: [],
     },
   },
   {
@@ -598,6 +793,26 @@ const FOOD_TOOLS = [
     },
   },
   {
+    name: "shift_plan",
+    description:
+      "Shift/rotate her ENTIRE week's workouts by N days in one call (forward = every workout moves to a later day, wrapping Sun→Mon; back = the opposite). Preserves each workout and her checked-off progress, which ride along to the new day. Use for 'move/push everything forward/back', 'shift my whole week', 'bump the schedule by 2 days'. NOT for building a new plan from scratch (tell her to tap Regenerate) and NOT for moving a single day (use move_workout_day) or editing one day (use adjust_workout_day).",
+    input_schema: {
+      type: "object",
+      properties: {
+        direction: {
+          type: "string",
+          enum: ["forward", "back"],
+          description: "forward = every workout moves to a LATER day (wrapping); back = earlier.",
+        },
+        days: {
+          type: "number",
+          description: "How many days to shift the whole week by. Defaults to 1 if omitted.",
+        },
+      },
+      required: ["direction"],
+    },
+  },
+  {
     name: "set_targets",
     description:
       "Update her daily macro targets. Accepts any subset of calories/protein/carbs/fat/fiber. If she only specifies calories, you can auto-distribute the macros (including fiber) via the formula. NEVER set calories below her BMR floor — refuse and explain she can adjust in Settings if she really wants.",
@@ -610,6 +825,36 @@ const FOOD_TOOLS = [
         fat: { type: "number", description: "Grams of fat per day." },
         fiber: { type: "number", description: "Grams of dietary fiber per day." },
       },
+    },
+  },
+  {
+    name: "suggest_meal",
+    description:
+      "Surface a meal SUGGESTION as an editorial card in the chat when you propose a specific meal to her. This does NOT log anything — a suggestion isn't eaten yet; it just shows the meal name and its calories/macros as a card with a 'Save for later' option. Call this in the SAME turn you propose the meal in prose, with your best estimate of the macros for that meal. Use it only for a concrete meal you're recommending (not for food she already ate — that's log_food).",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short meal name, e.g. 'Salmon & quinoa bowl'." },
+        label: {
+          type: "string",
+          description: "Editorial slot label shown on the card, e.g. 'LUNCH', 'DINNER', 'SNACK'. Defaults to 'MEAL'.",
+        },
+        calories: { type: "number", description: "Estimated calories for the suggested portion." },
+        protein: { type: "number", description: "Grams of protein." },
+        carbs: { type: "number", description: "Grams of carbohydrate." },
+        fat: { type: "number", description: "Grams of fat." },
+        fiber: { type: "number", description: "Grams of dietary fiber. Omit if you don't have a sensible estimate." },
+      },
+      required: ["name", "calories"],
+    },
+  },
+  {
+    name: "mark_bf_trend_surfaced",
+    description:
+      "Feature F2: call this in the SAME turn you raise the body-composition BF%-trend conversational suggestion (whether she approves, declines, or hasn't answered yet). It stamps a marker on the profile so the 14-day re-pester gate engages and you don't bring the same trend up again tomorrow. No arguments. Call exactly once when the BODY-COMPOSITION TREND ARMED block appears in the context. Do NOT call when the ARMED block isn't present.",
+    input_schema: {
+      type: "object",
+      properties: {},
     },
   },
   {
@@ -683,14 +928,15 @@ async function postMessages(
   model: string,
   useTools: boolean,
   forOpener = false,
-  summary = ""
+  summary = "",
+  crisisActive = false
 ): Promise<ApiResponse> {
   const body: Record<string, unknown> = {
     model,
     max_tokens: 1500,
     system: [
       { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
-      { type: "text", text: buildContextBlock(profile, forOpener, summary) },
+      { type: "text", text: buildContextBlock(profile, forOpener, summary, crisisActive) },
     ],
     messages,
   };
@@ -736,12 +982,13 @@ async function runConversation(
   model: string,
   runTool?: ToolRunner,
   forOpener = false,
-  summary = ""
+  summary = "",
+  crisisActive = false
 ): Promise<string> {
   const messages: ApiMessage[] = [...base];
   const useTools = !!runTool;
   for (let step = 0; step < 5; step++) {
-    const data = await postMessages(profile, messages, model, useTools, forOpener, summary);
+    const data = await postMessages(profile, messages, model, useTools, forOpener, summary, crisisActive);
     const blocks = data.content ?? [];
     const toolUses = blocks.filter(
       (b): b is { type: "tool_use"; id: string; name: string; input: unknown } =>
@@ -783,7 +1030,22 @@ export async function askCoach(
   const lastUser = [...history].reverse().find((m) => m.role === "user");
   // A photo always goes to Sonnet (vision + better food estimates).
   const model = lastUser?.imageBase64 ? SONNET : pickModel(lastUser?.content ?? "");
-  const text = await runConversation(profile, toApiMessages(history), model, runTool, false, summary);
+  // Feature F2 crisis-deferral: if the user's latest message tripped the
+  // deterministic crisis detector, suppress the BF%-trend ARMED block in this
+  // turn's context. The trend rule defers to the existing safety surface; the
+  // deterministic backstop in CoachScreen still appends crisis resources
+  // alongside the reply, so this only changes what the model sees — not what
+  // the user sees.
+  const crisisActive = !!lastUser && detectCrisisLanguage(lastUser.content);
+  const text = await runConversation(
+    profile,
+    toApiMessages(history),
+    model,
+    runTool,
+    false,
+    summary,
+    crisisActive
+  );
   return text || "(no response)";
 }
 
@@ -810,23 +1072,40 @@ export async function coachKickoff(profile: Profile, firstTime = false): Promise
   // she's ready. Read off profile.plan?.current rather than parsing context
   // text — it's authoritative and avoids prompt-string fragility.
   const hasPlan = !!profile.plan?.current;
+  // When cycle tracking is OFF the opener must NOT reference her cycle at all.
+  // We swap the cycle-acknowledgment instructions for an explicit no-cycle
+  // directive. (The context block carries the same OFF directive; this keeps the
+  // per-turn opener instructions from contradicting it.)
+  const cycleOff = currentPhase(profile).phase === "off";
+  const cyclePointFirstTime = cycleOff
+    ? "4) Do NOT mention her cycle, phase, or period — she has turned cycle tracking off. Keep the welcome entirely cycle-free.\n\n"
+    : "4) Acknowledge her cycle context: if she's on hormonal birth control, say so (no natural cycle to sync to) and skip any phase or day prediction. Otherwise name her current phase if known with one short feel-based note; if her phase isn't known yet, say you'll learn her rhythm as she logs. (Fold into the direction paragraph if it flows.)\n\n";
+  const planInviteFirstTime = hasPlan
+    ? "She just built a workout plan — nod to it briefly, say it's on her Plan tab and you'll work through it together. "
+    : cycleOff
+      ? "She doesn't have a workout plan yet — invite her to build one when she's ready, in one warm sentence (her direction plus training emphasis turned into a real weekly plan), without referencing her cycle. Not pushy. "
+      : "She doesn't have a workout plan yet — invite her to build one when she's ready, in one warm sentence (her direction plus cycle plus training emphasis turned into a real weekly plan). Not pushy. ";
   const kickoffContent = firstTime
     ? // FIRST-TIME WELCOME branch. Additive instruction over the same SYSTEM_PROMPT
       // + context block, so the load-bearing safety contract (ED_SAFETY_RULES at
       // the end of SYSTEM_PROMPT) and the deterministic numbers from the context
       // are unchanged. This message just shapes the OPENER content.
-      "This is our very first conversation — she just finished setting Flux up. Give her a warm, direct welcome in your tone — short paragraphs, conversational, no lists or formatting, no markdown. Speak like a real coach, not a wellness brand. Cover the following, woven together:\n\n" +
+      "This is our very first conversation — she just finished setting Wren up. Give her a warm, direct welcome in your tone — short paragraphs, conversational, no lists or formatting, no markdown. Speak like a real coach, not a wellness brand. Cover the following, woven together:\n\n" +
         "1) Greet her by name and acknowledge her goal directly. If WHAT YOU REMEMBER ABOUT HER includes notes on her direction, training emphasis, or motivation (those came from her onboarding), REFLECT THEM in your own coaching voice so she knows the onboarding mattered. E.g. if memory says 'leaner + stronger recomp' and 'strength + hypertrophy with some conditioning,' speak to building strength and leaning out together. Don't mention photos, uploads, or what she did/didn't share. If those memory notes aren't there, speak to her goal directly.\n\n" +
         "2) Present today's daily targets EXPLICITLY using the EXACT numbers from the context (calories, protein, carbs, fat) — never recompute or invent them. Frame them as a starting point she'll tune by results and how she feels. If the context says targets aren't available yet, skip the numbers and say plainly she should add age, height, and weight in Settings.\n\n" +
-        "3) Give her a SHORT, CONCRETE direction paragraph — how she's going to get there over the next few weeks. Speak like a real coach: if her goal is fat loss, name it honestly (you can say 'cut,' 'lean out,' 'fat loss,' 'calorie gap,' 'recomp' — these are normal coaching words). Tie the macros to what they do: protein for muscle and recovery, carbs to fuel training, fats for hormones and feel. Say where TRAINING EMPHASIS goes (reflect memory if present — e.g. 'lifting heavy 3-4 days with conditioning on the side' beats generic 'lift weights'). One short line on how the CYCLE factors in (many women push harder in follicular/ovulatory and steadier in late luteal/menstrual; for birth-control users, steady consistency and how she feels). Use ONLY numbers that are in the context — don't invent any. 3-5 sentences.\n\n" +
-        "4) Acknowledge her cycle context: if she's on hormonal birth control, say so (no natural cycle to sync to) and skip any phase or day prediction. Otherwise name her current phase if known with one short feel-based note; if her phase isn't known yet, say you'll learn her rhythm as she logs. (Fold into the direction paragraph if it flows.)\n\n" +
+        "3) Give her a SHORT, CONCRETE direction paragraph — how she's going to get there over the next few weeks. Speak like a real coach: if her goal is fat loss, name it honestly (you can say 'cut,' 'lean out,' 'fat loss,' 'calorie gap,' 'recomp' — these are normal coaching words). Tie the macros to what they do: protein for muscle and recovery, carbs to fuel training, fats for hormones and feel. Say where TRAINING EMPHASIS goes (reflect memory if present — e.g. 'lifting heavy 3-4 days with conditioning on the side' beats generic 'lift weights'). " +
+        (cycleOff
+          ? "Do NOT mention her cycle. "
+          : "One short line on how the CYCLE factors in (stated plainly as the general pattern: push harder in follicular/ovulatory and go steadier in late luteal/menstrual; for birth-control users, steady consistency and how she feels). ") +
+        "Use ONLY numbers that are in the context — don't invent any. 3-5 sentences.\n\n" +
+        cyclePointFirstTime +
         "5) If she has dietary preferences or restrictions in her preferences/rules or in long-term memory, reflect them briefly.\n\n" +
         "6) Set expectations: tell her she can tell you what she ate, ask what to eat, or just talk. " +
-        (hasPlan
-          ? "She just built a workout plan — nod to it briefly, say it's on her Plan tab and you'll work through it together. "
-          : "She doesn't have a workout plan yet — invite her to build one when she's ready, in one warm sentence (her direction plus cycle plus training emphasis turned into a real weekly plan). Not pushy. ") +
+        planInviteFirstTime +
         "\n\nDon't shame her, don't moralize food, don't push sub-safe targets. Beyond that, be a real coach: direct, honest, useful."
-    : "Kick us off for today in your tone. If WHAT TO NOTICE TODAY has anything, LEAD with the one or two most relevant noticings woven naturally into a warm hello (tie them to my cycle phase, energy, plan, or what you remember about me) — pick what matters most, don't list everything. If there's nothing notable, just a genuine hello. Then one line on what to focus on today given my cycle phase and goal. A few sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up.";
+    : cycleOff
+      ? "Kick us off for today in your tone. If WHAT TO NOTICE TODAY has anything, LEAD with the one or two most relevant noticings woven naturally into a warm hello (tie them to my energy, plan, or what you remember about me) — pick what matters most, don't list everything. Do NOT mention my cycle, phase, or period — I have cycle tracking off. If there's nothing notable, just a genuine hello. Then one line on what to focus on today given my goal. A few sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up."
+      : "Kick us off for today in your tone. If WHAT TO NOTICE TODAY has anything, LEAD with the one or two most relevant noticings woven naturally into a warm hello (tie them to my cycle phase, energy, plan, or what you remember about me) — pick what matters most, don't list everything. If there's nothing notable, just a genuine hello. Then one line on what to focus on today given my cycle phase and goal. A few sentences, human, no lists or formatting. Do not dump my macros and do not ask me to set anything up.";
   const kickoff: ApiMessage = { role: "user", content: kickoffContent };
   const text = await runConversation(profile, [kickoff], SONNET, undefined, true);
   return text || "(no response)";
@@ -942,7 +1221,7 @@ export type EstimatedFood = {
   fiber?: number;
 };
 
-const PHOTO_SYSTEM = `You are a nutrition vision assistant for the Flux app. Look at the photo and report the food.
+const PHOTO_SYSTEM = `You are a nutrition vision assistant for the Wren app. Look at the photo and report the food.
 - If it is a meal or plate: identify each distinct food and estimate its portion, calories, and macros from typical values. Estimates are approximate.
 - If it is a nutrition facts label or packaging: read the printed numbers exactly. Use the per-serving values and assume one serving unless the photo clearly shows otherwise.
 Report by calling the report_foods tool, one entry per food, with realistic numbers and short human names (e.g. "Grilled chicken breast", "White rice").
@@ -1069,7 +1348,7 @@ export type CalibrationResult = {
   goal_weight?: string;
 };
 
-const CALIBRATION_SYSTEM = `You are helping the Flux coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce short, QUALITATIVE notes the Coach can use to understand the direction she's going, plus pick the single best-fitting goal from the app's enum and (when appropriate) suggest a healthy goal weight.
+const CALIBRATION_SYSTEM = `You are helping the Wren coach get to know a woman during onboarding. She may share a photo of herself now and/or a photo that captures the direction she wants to go (a workout, a person, a vibe, a feeling she's drawn to). Your job is to produce short, QUALITATIVE notes the Coach can use to understand the direction she's going, plus pick the single best-fitting goal from the app's enum and (when appropriate) suggest a healthy goal weight.
 
 CALIBRATION SAFETY (overrides anything below it except the final SAFETY block):
 - Required fields are short strings: goal_direction, training_emphasis, motivation, goal. Plus OPTIONAL body_fat_range and goal_weight fields — see below.
@@ -1389,11 +1668,11 @@ export async function calibrateFromPhotos(
 
 // --- Feature E: tailored weekly plan generation --------------------------------
 
-const PLAN_SYSTEM = `You are the Flux coach building one week of training for a woman who trains with her cycle. You are an expert, honest coach — warm but never a yes-man.
+const PLAN_SYSTEM = `You are the Wren coach building one week of training for a woman who trains with her cycle. You are an expert, honest coach — warm but never a yes-man.
 
 TAILOR THE WEEK TO:
 - Her GOAL. Every choice serves it. Keep core lifts consistent week to week and progress them; this is a real program, not a random week.
-- Her CYCLE PHASE (a prior, not a rule): many women can push intensity in the follicular and ovulatory phases and feel better with steadier, lower-volume work in the late luteal and menstrual phases — but still TRAINING, scaled, not skipped. Frame as "many women find," never medical.
+- Her CYCLE PHASE (a prior, not a rule): the general pattern is that the follicular and ovulatory phases suit higher intensity, while the late luteal and menstrual phases suit steadier, lower-volume work — but still TRAINING, scaled, not skipped. State this plainly as a general pattern, never as a guarantee about her specifically, never medical.
 - Her ACCESS: gym -> barbell/machine/dumbbell lifts; home -> bodyweight, bands, dumbbells; classes -> schedule the classes she actually does (e.g. F45, Pilates, Lagree, spin) on sensible days. Only program what she can actually do.
 - Her EXPERIENCE (set sensible starting loads; for a first week say loads are a starting point to adjust by feel) and any INJURIES/LIMITATIONS (never program around or into an injury).
 - Her schedule: if she gave specific training days, train on exactly those and make the others rest/active recovery; if she only gave a number, choose sensible days. Keep each session within her time budget (a 25-minute day must be a real 25-minute workout, not a 60-minute one).
@@ -1401,6 +1680,7 @@ TAILOR THE WEEK TO:
 HONEST AND GOAL-ORIENTED (critical):
 - Adjustments must keep moving her toward her goal. Accommodate genuine fatigue and recovery, but do not just keep lowering things.
 - If her recent history shows a pattern of skipping or repeatedly backing off, say so plainly in whyThisWeek: name the tradeoff against her goal and give the smallest real option (a shorter or lighter session) instead of defaulting to rest. Be honest about the timeline if the pattern continues. Honest, not shaming; never moralize about food or her body.
+- If her recent history shows a lot of training beyond the plan or signs of inadequate recovery (many unplanned sessions on top of a full week, training most days with no real rest), do not praise the extra volume as progress; keep rest days real and build next week to absorb what she is already doing rather than stacking more on top. Note this plainly in whyThisWeek as recovery you are protecting, not a slowdown.
 
 OUTPUT:
 - Call generate_plan exactly once. Give each day a kind (strength/activity/class/rest), a short title, an intensity tag (rest/light/moderate/hard — used to set her calories), and for strength days, sections (warm-up, working sets, etc.) with exercises (name, sets, reps, weight in lb when applicable, and a short cue).
@@ -1467,7 +1747,16 @@ const GENERATE_PLAN_TOOL = {
   },
 };
 
-export type GenerateWeekOptions = { weekNumber?: number; recentSummary?: string; tweak?: string };
+// startDate anchors the plan's rolling 7-day window. A FRESH plan passes today's
+// ISO (the window starts now). The week-in-review rollover passes the PREVIOUS
+// week's startDate + 7 days so a selected-day pattern keeps repeating every 7
+// days continuously. If omitted we default to today (fresh-plan behavior).
+export type GenerateWeekOptions = {
+  weekNumber?: number;
+  recentSummary?: string;
+  tweak?: string;
+  startDate?: string;
+};
 
 function planContext(profile: Profile, setup: PlanSetup, opts: GenerateWeekOptions): string {
   const phase = currentPhase(profile);
@@ -1482,11 +1771,14 @@ function planContext(profile: Profile, setup: PlanSetup, opts: GenerateWeekOptio
   ]
     .filter(Boolean)
     .join(", ");
-  const cycle = phase.onBirthControl
-    ? "On hormonal birth control (no natural cycle to sync to — keep training steady)."
-    : phase.dayOfCycle
-      ? `${phase.phase} phase, cycle day ${phase.dayOfCycle} of ~${obs.length}${pred ? `; next period ~${pred.daysUntil} days away` : ""}`
-      : "cycle phase unknown (no period logged yet)";
+  const cycle =
+    phase.phase === "off"
+      ? "Cycle tracking is OFF for this user — do not mention or reference her menstrual cycle, phase, or period. Build the week without any cycle-based pacing; keep training steady."
+      : phase.onBirthControl
+        ? "On hormonal birth control (no natural cycle to sync to — keep training steady)."
+        : phase.dayOfCycle
+          ? `${phase.phase} phase, cycle day ${phase.dayOfCycle} of ~${obs.length}${pred ? `; next period ~${pred.daysUntil} days away` : ""}`
+          : "cycle phase unknown (no period logged yet)";
 
   return [
     `Goal: ${GOAL_LABELS[profile.goal]}`,
@@ -1529,7 +1821,12 @@ export async function generateWeekPlan(
       "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
-      model: SONNET,
+      // COST NOTE: plan generation uses OPUS rather than SONNET. Building a full
+      // week of programming benefits from Opus's stronger reasoning, and like the
+      // calibration call this fires rarely (once per plan request), so the higher
+      // per-call cost stays well under the prototype cap. Opus is slower — the
+      // breathing loading sequence already covers the longer wait.
+      model: OPUS,
       max_tokens: 4000,
       system: PLAN_SYSTEM,
       tools: [GENERATE_PLAN_TOOL],
@@ -1590,15 +1887,22 @@ export async function generateWeekPlan(
     };
   });
 
-  return {
+  // Pass 2a: densify so the returned week always carries all 7 weekday slots
+  // (the model often emits only training days + a couple rests). This keeps every
+  // weekday renderable in the Plan accordion and resolvable by the move/adjust
+  // handlers, even before the user touches the plan.
+  return densifyWeek({
     id: newId(),
     weekNumber: opts.weekNumber ?? 1,
-    startDate: mondayOf(new Date()),
+    // Rolling 7-day window anchor: fresh plan = today; rollover = prev+7
+    // (plumbed via opts.startDate). The generalized dateForWeekday maps each
+    // selected weekday to its next occurrence on/after this anchor.
+    startDate: opts.startDate ?? toISODate(new Date()),
     programName: raw.programName || "Your plan",
     whyThisWeek: raw.whyThisWeek || "",
     days,
     createdAt: Date.now(),
-  };
+  });
 }
 
 // --- Standalone assertions: rolling-summary fold trigger ------------------------

@@ -66,6 +66,7 @@ export function runMemoryAssertions(): string[] {
     tone: "bestie",
     dietaryRules: "",
     onBirthControl: false,
+    cycleTrackingEnabled: true,
     lastPeriodStart: "",
     avgCycleLength: 28,
     dayLogs: {},

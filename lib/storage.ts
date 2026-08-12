@@ -1,6 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Profile, ChatMessage } from "./types";
 import { toISODate } from "./cycle";
+import { densifyWeek } from "./plan";
 
 const PROFILE_KEY = "flux.profile";
 const CHAT_KEY = "flux.chat";
@@ -31,6 +32,11 @@ export async function loadProfile(): Promise<Profile | null> {
     if (!Array.isArray(p.weightLog)) p.weightLog = [];
     if (!Array.isArray(p.coachMemory)) p.coachMemory = []; // long-term Coach memory
     if (p.calorieMode !== "net") p.calorieMode = "static"; // default to the safe mode
+    // Back-compat: cycle tracking defaults to ON for any profile saved before this
+    // field existed. Use `=== false` semantics everywhere — only an explicit
+    // false (set when she taps "Turn off cycle tracking") counts as off, so a
+    // missing value can never silently disable tracking for an existing user.
+    if (p.cycleTrackingEnabled !== false) p.cycleTrackingEnabled = true;
     // Migrate the earlier Feature-B periodLog array (bleed days only) into dayLogs.
     if (Array.isArray(p.periodLog)) {
       for (const d of p.periodLog) {
@@ -48,6 +54,71 @@ export async function loadProfile(): Promise<Profile | null> {
       p.currentFrontPhotoUri = p.currentPhotoUri;
     }
     delete p.currentPhotoUri;
+    // Feature F1 back-compat: seed photoLog from the onboarding calibration photos
+    // so a returning user's first timeline entry isn't blank. Only run when
+    // photoLog is missing entirely — an explicit [] means she's already on the new
+    // model (possibly having cleared it), so we leave it alone. We deliberately
+    // keep currentFront/SidePhotoUri intact: they remain the calibration anchors
+    // and are read elsewhere (Settings, future re-calibration).
+    if (!Array.isArray(p.photoLog)) {
+      if (p.currentFrontPhotoUri || p.currentSidePhotoUri) {
+        p.photoLog = [
+          {
+            id: `seed-${Date.now()}`,
+            date: toISODate(new Date()),
+            frontUri: p.currentFrontPhotoUri,
+            sideUri: p.currentSidePhotoUri,
+          },
+        ];
+      } else {
+        p.photoLog = [];
+      }
+    }
+    // Pass 2a back-compat: existing stored plans were generated before the week
+    // was guaranteed dense, so `plan.current.days` is often a PARTIAL array (only
+    // the weekdays the model emitted). Densify the current week and every history
+    // week so all 7 weekday slots exist — this makes Coach moves/edits land on a
+    // renderable Plan-tab slot and keeps the move/adjust handlers always able to
+    // resolve a weekday. densifyWeek PRESERVES every existing day object (exercises,
+    // done flags, loggedEntryId, titles) and only ADDS missing rest days, so this
+    // is idempotent (a no-op on an already-dense plan) and never reshapes real data.
+    if (p.plan) {
+      if (p.plan.current) p.plan.current = densifyWeek(p.plan.current);
+      if (Array.isArray(p.plan.history)) {
+        p.plan.history = p.plan.history.map((w) => densifyWeek(w));
+      }
+    }
+    // Workout source back-compat: entries stored before the source union gained
+    // "plan" used "coach" for BOTH plan check-offs AND Coach chat logs, so the
+    // Log card mislabeled every chat log as "From your plan". Best-effort
+    // reconcile on load: any workout entry whose id is referenced by a plan
+    // day's `loggedEntryId` (in the current week or any history week) was a plan
+    // check-off → rewrite "coach" → "plan". Anything else stays "coach" and now
+    // reads "From Coach". A chat-logged entry can never be a plan day's
+    // loggedEntryId, so it's never misclassified as plan. The only imperfect
+    // case: an ancient plan check-off whose week has rotated out of both current
+    // and history is no longer referenced, so it stays "coach" and reads
+    // "From Coach" — acceptable for pre-existing data. New entries are tagged
+    // correctly at creation and skip this path entirely.
+    if (p.plan) {
+      const planEntryIds = new Set<string>();
+      const collect = (w?: { days?: { loggedEntryId?: string }[] } | null) => {
+        for (const d of w?.days ?? []) {
+          if (d.loggedEntryId) planEntryIds.add(d.loggedEntryId);
+        }
+      };
+      collect(p.plan.current);
+      if (Array.isArray(p.plan.history)) p.plan.history.forEach(collect);
+      if (planEntryIds.size) {
+        for (const date of Object.keys(p.workoutLogs)) {
+          const entries = p.workoutLogs[date];
+          if (!Array.isArray(entries)) continue;
+          for (const e of entries) {
+            if (e.source === "coach" && planEntryIds.has(e.id)) e.source = "plan";
+          }
+        }
+      }
+    }
     return p;
   } catch {
     return null;
@@ -64,7 +135,7 @@ export async function saveProfile(p: Profile): Promise<void> {
   try {
     await AsyncStorage.setItem(PROFILE_KEY, JSON.stringify(p));
   } catch (e) {
-    console.warn("Flux: failed to save profile to storage", e);
+    console.warn("Wren: failed to save profile to storage", e);
   }
 }
 
@@ -130,7 +201,7 @@ export async function saveChat(
   try {
     await AsyncStorage.setItem(CHAT_KEY, JSON.stringify(payload));
   } catch (e) {
-    console.warn("Flux: failed to save chat to storage", e);
+    console.warn("Wren: failed to save chat to storage", e);
   }
 }
 
@@ -138,11 +209,11 @@ export async function clearChat(): Promise<void> {
   try {
     await AsyncStorage.removeItem(CHAT_KEY);
   } catch (e) {
-    console.warn("Flux: failed to clear chat from storage", e);
+    console.warn("Wren: failed to clear chat from storage", e);
   }
 }
 
-// "Start over": wipe everything Flux persists — the profile (which carries all the
+// "Start over": wipe everything Wren persists — the profile (which carries all the
 // data maps: dayLogs/foodLogs/workoutLogs/savedFoods/savedMeals/weightLog/plan/
 // coachMemory) AND the chat. Used only by the destructive Settings reset so
 // first-run onboarding can be re-tested. Reuses the same key constants as the
@@ -154,6 +225,6 @@ export async function clearAllData(): Promise<void> {
   try {
     await AsyncStorage.multiRemove([PROFILE_KEY, CHAT_KEY]);
   } catch (e) {
-    console.warn("Flux: failed to clear all data from storage", e);
+    console.warn("Wren: failed to clear all data from storage", e);
   }
 }

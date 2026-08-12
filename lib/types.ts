@@ -1,4 +1,4 @@
-// Shared data types for Flux — Feature A (the Coach prototype).
+// Shared data types for Wren — Feature A (the Coach prototype).
 
 export type Goal = "lose_fat" | "tone_up" | "build_muscle" | "feel_better" | "maintain";
 
@@ -9,10 +9,18 @@ export type ActivityLevel = "sedentary" | "light" | "active" | "very_active";
 // The user's profile. Saved once in Settings, persisted locally on the device.
 export type Profile = {
   name: string;
+  profilePhotoUri?: string;
   goal: Goal;
   tone: Tone;
   dietaryRules: string; // free text, e.g. "no dairy, prefers mornings, hates burpees"
   onBirthControl: boolean;
+  // When false, the user has turned cycle tracking fully OFF: all cycle UI is
+  // hidden app-wide and the Coach must not reference her menstrual cycle, phase,
+  // or period. Independent of `onBirthControl` (a BC user still has tracking ON,
+  // just without phase predictions). BACK-COMPAT: a missing value resolves to
+  // `true` (loadProfile normalizes it) so no existing profile is silently turned
+  // off — every "is off" check uses `=== false`.
+  cycleTrackingEnabled: boolean;
   lastPeriodStart: string; // ISO date "YYYY-MM-DD"; ignored if onBirthControl. Legacy single-date field; kept in sync with the latest start derived from dayLogs for back-compat.
   avgCycleLength: number; // days, default 28. Used as the prior until dayLogs have enough history to observe the real average.
   // Feature B: daily cycle check-ins keyed by ISO "YYYY-MM-DD". A day counts as a
@@ -74,6 +82,28 @@ export type Profile = {
   currentFrontPhotoUri?: string;
   currentSidePhotoUri?: string;
   goalPhotoUri?: string;
+  // Feature F1: timeline of optional body photos surfaced on the Progress tab.
+  // Stored URIs only (no base64) — same cache-uri-only stance as the calibration
+  // photos. ED-safety: the app NEVER scores, captions, or editorializes these
+  // entries; the timeline is a passive log she chooses to grow (or not).
+  photoLog?: BodyPhotoEntry[];
+  // ISO timestamp the user dismissed the "it's been ~N weeks" banner. We compare
+  // against the newest photoLog entry on read; a later entry re-arms the banner.
+  photoBannerDismissedAt?: string;
+  // Feature F2: optional timeline of REAL body-composition scan results (DEXA /
+  // InBody / "other"). This is DISTINCT from the US Navy tape-measure infra
+  // (waistIn/neckIn/hipIn + lib/bodycomp.ts navyBodyFatPercent), which drives the
+  // onboarding calibration vision call from MEASUREMENTS, not from scans. The
+  // scan log is a separate, user-curated source: actual machine numbers she
+  // enters when she gets one. Both can coexist; neither feeds the other. The
+  // Coach receives this log as factual context (latest + trend) but never gets
+  // an image — these are numeric entries only.
+  bodyCompLog?: BodyCompEntry[];
+  // ISO timestamp the Coach last surfaced the BF%-trend suggestion. Used to
+  // gate re-pestering: the rule below requires >=14 days since this marker
+  // before the Coach can raise the same trend again. Set when the Coach calls
+  // the mark_bf_trend_surfaced tool (in the same turn it raises the trend).
+  lastBfTrendSurfacedAt?: string;
   // User-set macro override. When present, computeTargets returns these numbers
   // verbatim and skips the goal-multiplier + BMR floor math. The override may
   // sit BELOW the BMR floor — that's allowed only because Settings forces a
@@ -140,6 +170,65 @@ export const DIGESTION_OPTIONS = [
   "Normal", "Bloated", "Gassy", "Constipated", "Loose", "Nauseous", "Reflux",
 ];
 
+// An editorial "data card" rendered in the chat under an assistant turn (see the
+// Coach mockup). Two kinds:
+//   - "logged": derived in code from a log_food tool run this turn (the food is
+//     already in her diary). NO model/prompt involvement — built client-side.
+//   - "suggested": surfaced by the Coach via the suggest_meal tool when it
+//     proposes a meal. NOTHING is logged for a suggestion (it isn't consumed);
+//     the card just carries the macro numbers + enough identity to SAVE it later.
+// Persisted automatically because it lives on ChatMessage (saveChat serializes it).
+export type CoachCard = CoachFoodCard | CoachPlanChangeCard | CoachPlanShiftCard;
+
+// The original food card (logged or suggested meal). Unchanged shape.
+export type CoachFoodCard = {
+  kind: "logged" | "suggested";
+  label: string; // editorial label shown small + tracked, e.g. "BREAKFAST", "LUNCH"
+  name: string; // the food/meal name, e.g. "Eggs & toast"
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+  fiber?: number; // optional, like FoodEntry — back-compat + not always estimated
+  // Enough identity to build a SavedFood when she taps "Save for later" on a
+  // suggested card. Mirrors the SavedFood shape's optional fields.
+  brand?: string;
+  quantityLabel?: string;
+};
+
+// CONFABULATION GUARD (workout-trust Stage 1): an authoritative "PLAN UPDATED"
+// card pushed by the plan handlers (adjust_workout_day / move_workout_day) AFTER
+// the write lands. It is built from the ACTUAL saved profile state (pre vs post),
+// never from the model's tool args — so the model can't tell her a day changed
+// without a real change behind it. Display-only for now (no Undo until Stage 4).
+export type CoachPlanChangeCard = {
+  kind: "plan_change";
+  // Human weekday label(s) the change touched, e.g. "MON" or "MON → TUE".
+  dayLabel: string;
+  oldTitle: string; // the affected day's title before the write
+  newTitle: string; // the affected day's title after the write (read back)
+  // Exercise-level diff, computed from the real pre/post sections via dayExercises.
+  added: number; // exercises present after but not before
+  removed: number; // exercises present before but not after
+  kept: number; // exercises present both before and after
+  // True when NO previously-done exercise lost its done flag (completion intact);
+  // false when at least one checked-off exercise's done flag was dropped by the
+  // write (the destructive full-replace can do this — the card shows it honestly).
+  completionPreserved: boolean;
+};
+
+// CONFABULATION GUARD (shift_plan): an authoritative "PLAN SHIFTED" card pushed
+// by the shift_plan handler AFTER the whole-week rotation lands. Like
+// CoachPlanChangeCard, it is produced only when a real, material rotation
+// occurred — so the model can't tell her the week moved without a real change
+// behind it. Carries just the direction + magnitude (the per-day diff is the
+// rotation itself; the Plan tab shows the result). Display-only.
+export type CoachPlanShiftCard = {
+  kind: "plan_shift";
+  direction: "forward" | "back";
+  days: number; // positive count of days the whole week rotated by
+};
+
 // One line in the Coach conversation.
 export type ChatMessage = {
   role: "user" | "assistant";
@@ -147,21 +236,24 @@ export type ChatMessage = {
   date?: string; // "YYYY-MM-DD" the message belongs to (for day dividers + today-scoping)
   imageUri?: string; // local uri of an attached meal photo, shown in the bubble
   imageBase64?: string; // transient: JPEG sent to the vision model; stripped before persisting
+  // Optional editorial data cards attached to an ASSISTANT message (logged or
+  // suggested meals). Rendered full-width under the bubble; persisted via saveChat.
+  cards?: CoachCard[];
 };
 
 // Human-readable labels for goals (shown in the UI and sent to the Coach).
 export const GOAL_LABELS: Record<Goal, string> = {
-  lose_fat: "Lose body fat",
-  tone_up: "Tone up",
-  build_muscle: "Build muscle",
-  feel_better: "Feel better / more energy",
+  lose_fat: "Lean out",
+  tone_up: "Tone & define",
+  build_muscle: "Build strength",
+  feel_better: "Feel better",
   maintain: "Maintain",
 };
 
 export const TONE_LABELS: Record<Tone, string> = {
   hype: "Hype",
-  bestie: "Bestie",
-  tough_love: "Tough Love",
+  bestie: "Knowledgeable friend",
+  tough_love: "Tough love",
 };
 
 // Style descriptions sent to the Coach so it embodies the chosen tone.
@@ -174,10 +266,10 @@ export const TONE_STYLE: Record<Tone, string> = {
 };
 
 export const ACTIVITY_LABELS: Record<ActivityLevel, string> = {
-  sedentary: "Sedentary (little or no exercise)",
-  light: "Lightly active (1-3 days/week)",
-  active: "Active (3-5 days/week)",
-  very_active: "Very active (6-7 days/week)",
+  sedentary: "Mostly seated",
+  light: "Lightly active",
+  active: "Active",
+  very_active: "Very active",
 };
 
 // --- Feature C: food + water logging -----------------------------------------
@@ -208,6 +300,51 @@ export type SavedMeal = { id: string; name: string; items: SavedFood[] };
 
 // One optional weigh-in (Progress tab). lbs to match the rest of the app.
 export type WeightEntry = { date: string; lbs: number };
+
+// Feature F2 — one entry in the optional body-composition scan log on the
+// Progress tab. Source = DEXA / InBody / "other" (any third-party scan she
+// happens to get). bodyFatPct is the headline metric; leanMassLbs and
+// muscleMassLbs are both optional because different reports surface them
+// differently (DEXA -> lean mass; InBody -> muscle mass distinct from lean).
+// note is free text. None of id/date are optional — those are always written
+// at save-time.
+//
+// NOT to be confused with the Navy tape-measurement infrastructure
+// (waistIn/neckIn/hipIn + lib/bodycomp.ts navyBodyFatPercent) which lives on
+// the Profile separately and drives the onboarding calibration call. The two
+// sources never feed each other: the tape method is a measurement-derived
+// proxy used once at onboarding; this log is real machine scan output the
+// user enters by hand.
+export type BodyCompSource = "dexa" | "inbody" | "other";
+
+export type BodyCompEntry = {
+  id: string;
+  date: string; // "YYYY-MM-DD"
+  source: BodyCompSource;
+  bodyFatPct?: number; // percentage as number, e.g. 22.4
+  leanMassLbs?: number;
+  muscleMassLbs?: number; // InBody often reports this separately from lean mass
+  note?: string;
+};
+
+export const BODY_COMP_SOURCE_LABELS: Record<BodyCompSource, string> = {
+  dexa: "DEXA",
+  inbody: "InBody",
+  other: "Other",
+};
+
+// Feature F1 — one entry in the optional body-photo timeline on the Progress tab.
+// frontUri is what the UI surfaces as the "main" photo; sideUri is an optional
+// second angle. note is free text she may or may not write. All fields except
+// id/date are optional so an empty entry shouldn't exist — the save flow
+// requires at least one URI.
+export type BodyPhotoEntry = {
+  id: string;
+  date: string; // "YYYY-MM-DD"
+  frontUri?: string;
+  sideUri?: string;
+  note?: string;
+};
 
 // One logged food. Macros are stored for the AMOUNT she logged, so a day's
 // totals are a plain deterministic sum (the durable fix for the calorie bug).
@@ -265,7 +402,20 @@ export type WorkoutEntry = {
   avgHr?: number; // optional, from her watch
   maxHr?: number; // optional, from her watch
   note?: string;
-  source: "manual" | "coach";
+  // Optional short descriptive focus carried over from a plan day (PlanDay.focus),
+  // e.g. "hips, t-spine, slow core". DISPLAY-ONLY: it's surfaced in the Log card's
+  // detail line and nowhere else — never used in burn estimation, plan generation,
+  // calorie math, or Coach logic. Absent on manual/Coach-chat entries (no plan
+  // origin), and absent on entries stored before this field existed; both are fine
+  // because it's optional and purely cosmetic (no migration needed).
+  focus?: string;
+  // Origin of the entry, used for the Log card's source pill:
+  //   "plan"   = a plan-day check-off (Plan tab: toggleDayDone/commitDay or
+  //              toggleExercise/syncStrengthLog) → "From your plan"
+  //   "coach"  = a Coach chat log via log_workout                → "From Coach"
+  //   "manual" = hand-entered in the Log's add sheet             → "Added manually"
+  // Purely a display label — never used in burn/calorie math.
+  source: "manual" | "coach" | "plan";
   createdAt: number;
 };
 

@@ -1,22 +1,30 @@
 {
   "expo": {
-    "name": "flux",
-    "slug": "flux",
+    "name": "wren",
+    "slug": "wren",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.tinggeidel.wren",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
+      "package": "com.tinggeidel.wren",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#E3E8E9",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -26,16 +34,29 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow Flux to use the camera to scan food barcodes."
+          "cameraPermission": "Allow Wren to use the camera to scan food barcodes."
         }
       ],
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow Flux to access your photos to log a meal or nutrition label.",
-          "cameraPermission": "Allow Flux to use the camera to snap a meal or nutrition label."
+          "photosPermission": "Allow Wren to access your photos to log a meal or nutrition label.",
+          "cameraPermission": "Allow Wren to use the camera to snap a meal or nutrition label."
         }
-      ]
-    ]
+      ],
+      "expo-font"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "3a5a2b29-3c24-4985-8685-05d34b7a0c77"
+      }
+    },
+    "owner": "tinggeidel",
+    "updates": {
+      "url": "https://u.expo.dev/3a5a2b29-3c24-4985-8685-05d34b7a0c77"
+    },
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    }
   }
 }

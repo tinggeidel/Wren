@@ -18,7 +18,7 @@
 
 import { Profile, DayLog } from "./types";
 import { toISODate, addDays, nextPredictedPeriod } from "./cycle";
-import { planDayForDate, dayLogged, isTrainingDay, dateForWeekday } from "./plan";
+import { planDayForDate, dayLogged, dayComplete, isTrainingDay, dateForWeekday } from "./plan";
 
 // One thing worth mentioning. `kind` lets the prompt/ED-safety reason about the
 // category; `text` is the short factual line the Coach narrates in her voice.
@@ -116,9 +116,14 @@ export function workoutAdherence(
     missed += 1;
   }
 
-  // Strong run: completion ratio of this week's training days so far.
+  // Strong run: completion ratio of this week's training days so far. This is a
+  // "finished sessions" signal (praise for genuinely completing work), so it uses
+  // dayComplete — a partially-checked strength day is not yet a completed session
+  // and shouldn't inflate the praise. (The missed-streak above deliberately uses
+  // dayLogged instead: a partial check-off means she DID show up, so it breaks a
+  // no-show streak even though the session isn't fully done.)
   const training = cur.days.filter(isTrainingDay);
-  const done = training.filter(dayLogged).length;
+  const done = training.filter(dayComplete).length;
   const total = training.length;
 
   // Prefer surfacing a real miss streak (honest nudge) over praise.
@@ -184,7 +189,9 @@ export function detectNoticings(p: Profile, today: Date = new Date()): Noticing[
   }
 
   // 3) Cycle: gentle heads-up if her next predicted period is within a few days.
-  const heads = periodHeadsUp(p, today);
+  // Suppressed entirely when cycle tracking is OFF (=== false so legacy/undefined
+  // profiles still get the heads-up) — the Coach must surface nothing cycle then.
+  const heads = p.cycleTrackingEnabled === false ? null : periodHeadsUp(p, today);
   if (heads) {
     const when =
       heads.daysUntil === 0
@@ -244,6 +251,7 @@ export function runPatternAssertions(): string[] {
     tone: "bestie",
     dietaryRules: "",
     onBirthControl: false,
+    cycleTrackingEnabled: true,
     lastPeriodStart: "",
     avgCycleLength: 28,
     dayLogs: {},

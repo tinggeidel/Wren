@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { View, Text, TouchableOpacity, StyleSheet } from "react-native";
+import { colors, type, spacing, radius } from "../lib/theme";
 
 // --- Stepper (core RN only, no native dep) ---------------------------------
 // A -/+ row with a centered value. Extracted from OnboardingScreen so other
@@ -82,6 +83,14 @@ export function Stepper({
   // Default false preserves the original look for callers that always commit
   // (e.g. WorkoutScreen's session-minutes stepper).
   dimmed = false,
+  // OPTIONAL committed-value font size override (Onboarding 3rd fidelity pass).
+  // When undefined the value renders at the original `type.size.title - 2`
+  // (~22px) so existing callers — notably WorkoutScreen — are byte-for-byte
+  // unchanged. Onboarding passes ~28 to bring the height/weight/cycle numerals
+  // up to the scaled-up onboarding type. Only affects the COMMITTED value text;
+  // the dimmed "· not set" preview keeps its own (smaller) size so the
+  // placeholder still reads as a non-committed default.
+  valueFontSize,
 }: {
   value: number;
   min: number;
@@ -91,6 +100,7 @@ export function Stepper({
   display: string;
   onChange: (next: number) => void;
   dimmed?: boolean;
+  valueFontSize?: number;
 }) {
   const clamp = (n: number) => Math.max(min, Math.min(max, n));
   return (
@@ -101,7 +111,14 @@ export function Stepper({
         onStep={() => onChange(clamp(value - step))}
       />
       <View style={[styles.stepperValueBox, dimmed && styles.stepperValueBoxDimmed]}>
-        <Text style={[styles.stepperValue, dimmed && styles.stepperValueDimmed]}>
+        <Text
+          style={[
+            styles.stepperValue,
+            dimmed && styles.stepperValueDimmed,
+            // Override only the committed (non-dimmed) value size when asked.
+            !dimmed && valueFontSize != null ? { fontSize: valueFontSize } : null,
+          ]}
+        >
           {dimmed ? `${display} · not set` : display}
         </Text>
       </View>
@@ -114,45 +131,46 @@ export function Stepper({
   );
 }
 
-// Styles copied verbatim from the original OnboardingScreen definitions so the
-// height/weight steppers render pixel-identically after the extraction. The
-// ACCENT color matches the Flux purple used across both screens.
-const ACCENT = "#7c3aed";
+// De-purpled to the warm brand register: the old Wren purple (#7c3aed) and its
+// grey neutrals are swapped for brand tokens. The +/- glyphs and value text are
+// cocoa (ink); rest fills are the warm creamTile; borders are the warm
+// rowHairline; disabled states fade to mist/clay. Behavior and props unchanged.
 const styles = StyleSheet.create({
   // Big −/+ buttons flanking a centered value.
-  stepperRow: { flexDirection: "row", alignItems: "stretch", gap: 10, marginTop: 2 },
+  stepperRow: { flexDirection: "row", alignItems: "stretch", gap: spacing.sm + 2, marginTop: 2 },
   stepBtn: {
     width: 64,
     height: 56,
     borderWidth: 1,
-    borderColor: "#ddd",
-    borderRadius: 10,
-    backgroundColor: "#f0eef7",
+    borderColor: colors.rowHairline, // warm cocoa hairline (was #ddd)
+    borderRadius: radius.sm + 2, // 10
+    backgroundColor: colors.creamTile, // warm rest fill (was lilac #f0eef7)
     alignItems: "center",
     justifyContent: "center",
   },
-  stepBtnDisabled: { backgroundColor: "#f7f7f7", borderColor: "#eee" },
-  stepBtnText: { fontSize: 28, fontWeight: "700", color: ACCENT, lineHeight: 32 },
-  stepBtnTextDisabled: { color: "#ccc" },
+  stepBtnDisabled: { backgroundColor: colors.surface, borderColor: colors.rowHairline },
+  // Cocoa glyph (was the purple ACCENT). fontFamily carries the 700 weight —
+  // no companion fontWeight per the Manrope rule.
+  stepBtnText: { fontSize: 28, fontFamily: type.numeral.family, color: colors.ink, lineHeight: 32 },
+  stepBtnTextDisabled: { color: colors.divider }, // mist (was #ccc)
   stepperValueBox: {
     flex: 1,
     height: 56,
     borderWidth: 1,
-    borderColor: "#ddd",
-    borderRadius: 10,
-    backgroundColor: "#fafafa",
+    borderColor: colors.rowHairline, // warm cocoa hairline (was #ddd)
+    borderRadius: radius.sm + 2, // 10
+    backgroundColor: colors.creamTile, // warm fill (was #fafafa)
     alignItems: "center",
     justifyContent: "center",
   },
-  // "Not set" preview state: subtler border + lighter fill so the box visually
-  // reads as a placeholder, not a committed value. Paired with stepperValueDimmed
-  // text style (gray + italic + lighter weight) so the contrast carries even
-  // when the dimmed box is glanced at quickly.
+  // "Not set" preview state: subtler border + lighter fill so the box reads as a
+  // placeholder, not a committed value.
   stepperValueBoxDimmed: {
-    borderColor: "#eee",
-    backgroundColor: "#f7f7f7",
+    borderColor: colors.rowHairline,
+    backgroundColor: colors.surface,
     borderStyle: "dashed",
   },
-  stepperValue: { fontSize: 22, fontWeight: "700", color: "#1a1a1a" },
-  stepperValueDimmed: { color: "#9a9aa3", fontWeight: "500", fontStyle: "italic", fontSize: 18 },
+  // Cocoa value text (was near-black #1a1a1a). fontFamily carries the weight.
+  stepperValue: { fontSize: type.size.title - 2, fontFamily: type.numeral.family, color: colors.ink },
+  stepperValueDimmed: { color: colors.inkMuted, fontFamily: type.ui.family, fontSize: type.size.body + 2 },
 });

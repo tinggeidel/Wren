@@ -27,7 +27,7 @@ export default function BarcodeScanner({
       <View style={styles.center}>
         <Text style={styles.permTitle}>Camera access</Text>
         <Text style={styles.permText}>
-          Flux needs the camera to scan food barcodes. Nothing is recorded — it just reads the code.
+          Wren needs the camera to scan food barcodes. Nothing is recorded — it just reads the code.
         </Text>
         <TouchableOpacity style={styles.permBtn} onPress={requestPermission}>
           <Text style={styles.permBtnText}>Allow camera</Text>
@@ -51,6 +51,11 @@ export default function BarcodeScanner({
           handled
             ? undefined
             : ({ data }) => {
+                // Belt guard: `handled` is async to apply, so within a single
+                // mount expo-camera can fire several callbacks before the handler
+                // is swapped to undefined. Drop repeats synchronously. (The parent
+                // CoachScreen also holds a durable ref lock that survives remount.)
+                if (handled) return;
                 if (!data) return;
                 setHandled(true);
                 onScanned(data);

@@ -168,6 +168,13 @@ export function isFoodSaved(p: Profile, food: SavedFood): boolean {
   return (p.savedFoods ?? []).some((s) => sameFood(s, food));
 }
 
+// Find the persisted saved-food matching `food` by the SAME identity isFoodSaved
+// / saveFood dedupe on (name+brand via sameFood). The unsave path needs the
+// matching row's id; this is the single source of truth so it can't desync.
+export function findSavedFood(p: Profile, food: SavedFood): SavedFood | undefined {
+  return (p.savedFoods ?? []).find((s) => sameFood(s, food));
+}
+
 // Save (or refresh) a favorite food, most-recent first, deduped by name+brand.
 export function saveFood(p: Profile, food: SavedFood): Profile {
   const rest = (p.savedFoods ?? []).filter((s) => !sameFood(s, food));
@@ -235,7 +242,7 @@ export function addWater(p: Profile, date: string, delta: number): Profile {
 // Search + barcode lookup. We normalize the messy crowdsourced data into a tidy
 // FoodHit; the UI then lets her pick a quantity, and scaleHit() does the math.
 
-const OFF_HEADERS = { "User-Agent": "FluxApp/0.1 (solo prototype)" };
+const OFF_HEADERS = { "User-Agent": "WrenApp/0.1 (solo prototype)" };
 
 export type FoodHit = {
   id: string;
@@ -303,6 +310,178 @@ export function scaleHit(hit: FoodHit, grams: number): Macros {
     fat: Math.round(hit.per100g.fat * f),
     fiber: Math.round(hit.per100g.fiber * f),
   };
+}
+
+// --- Quantity parsing + macro rescaling --------------------------------------
+// Shared by the manual edit sheet (FoodScreen) and the Coach `edit_food` tool so
+// the two can't drift. A FoodEntry stores macros as ABSOLUTE totals for the
+// amount logged; when she changes the serving we re-derive those totals.
+
+// Gram-unit tokens that let us scale off the per-100g basis (the accurate path).
+const GRAM_UNITS = new Set(["g", "gram", "grams", "gm", "gms"]);
+// Serving-style units. A serving label carries a per-serving gram weight in its
+// parenthetical (e.g. "1 serving (150 g)"), so the TRUE scalable quantity is
+// (serving count) x (grams per serving) — see rescaleMacrosForQuantity.
+const SERVING_UNITS = new Set(["serving", "servings", "portion", "portions"]);
+
+// Two units describe the same measure if they're equal, if either is blank (a
+// bare number like "3" inherits the other's unit), or if they differ only by a
+// trailing plural "s" ("serving"/"servings", "cup"/"cups"). This is deliberately
+// NOT gram<->serving: those never proportionally match.
+function unitsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (a === "" || b === "") return true;
+  return a.replace(/s$/, "") === b.replace(/s$/, "");
+}
+
+// Build the canonical serving label so the parenthetical grams always reflect
+// the real grams after a rescale ("2 servings (340 g)"), never a stale weight.
+function servingLabel(count: number, grams: number): string {
+  const c = Math.round(count * 100) / 100; // keep 1.5, drop float noise
+  return `${c} serving${c === 1 ? "" : "s"} (${Math.round(grams)} g)`;
+}
+
+// Pull the leading numeric token (decimal or simple "a/b" fraction), the trailing
+// unit word, and any parenthetical gram weight from a portion label. `grams` is
+// the "(M g)" amount when present — the scalable basis for serving labels.
+//   "150 g"             -> { num: 150, unit: "g" }
+//   "2 eggs"            -> { num: 2,   unit: "eggs" }
+//   "1/2 cup"           -> { num: 0.5, unit: "cup" }
+//   "1 serving (28 g)"  -> { num: 1,   unit: "serving", grams: 28 }
+//   "banana"            -> null
+export function parseQuantity(
+  label: string
+): { num: number; unit: string; grams?: number } | null {
+  const s = (label ?? "").trim();
+  if (!s) return null;
+  // Leading number: a fraction "a/b" OR a plain decimal. Fraction is tried first
+  // so "1/2" isn't read as the integer 1.
+  const m = s.match(/^(\d+(?:\.\d+)?\/\d+(?:\.\d+)?|\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  const token = m[1];
+  let num: number;
+  if (token.includes("/")) {
+    const [a, b] = token.split("/").map((t) => parseFloat(t));
+    if (!b || !isFinite(a) || !isFinite(b)) return null;
+    num = a / b;
+  } else {
+    num = parseFloat(token);
+  }
+  if (!isFinite(num)) return null;
+  // Unit = first run of letters after the number (lowercased). Empty if none.
+  const rest = s.slice(m[0].length).trim();
+  const um = rest.match(/^[a-zA-Z]+/);
+  // Parenthetical gram weight anywhere in the label, e.g. "1 serving (150 g)".
+  const gm = s.match(/\((\d+(?:\.\d+)?)\s*(?:g|gram|grams|gm|gms)\b/i);
+  const grams = gm ? parseFloat(gm[1]) : NaN;
+  return {
+    num,
+    unit: um ? um[0].toLowerCase() : "",
+    ...(isFinite(grams) && grams > 0 ? { grams } : {}),
+  };
+}
+
+// Recompute an entry's absolute macros for a new portion label, and return the
+// label the user should end up seeing (with its parenthetical grams corrected).
+//
+// The model: for anything gram-based we know the true grams; for a serving label
+// the true grams are (serving count) x (grams per serving), where grams-per-
+// serving comes from the ORIGINAL entry's parenthetical (150 g / 1 serving). So
+// editing the serving COUNT rescales macros AND rewrites the "(… g)" to match,
+// and editing the parenthetical grams directly is honored too.
+//
+// Priority for the derived macros:
+//  (a) known grams + per100g basis -> scale from per-100g (most accurate).
+//  (b) known grams + the original's grams -> proportional by grams.
+//  (c) unit-matched count ratio off the entry's own macros.
+//  (d) otherwise null -> caller leaves the macros untouched; NEVER zero them.
+// Returned fiber is always a number (best-effort; 0 when unknown); callers that
+// honor the "fiber untracked" back-compat gate it on the entry's own fiber.
+export function rescaleMacrosForQuantity(
+  entry: FoodEntry,
+  newLabel: string
+): { macros: Macros; label: string } | null {
+  const parsed = parseQuantity(newLabel);
+  if (!parsed || parsed.num <= 0) return null;
+  const old = entry.quantityLabel ? parseQuantity(entry.quantityLabel) : null;
+
+  const clampRound = (v: number) => Math.max(0, Math.round(v));
+
+  // --- Resolve the authoritative grams for the new amount, when we can. --------
+  const oldIsServing = !!old && SERVING_UNITS.has(old.unit);
+  const newIsGram = GRAM_UNITS.has(parsed.unit);
+  // A bare number ("2") inherits a serving basis from the original entry.
+  const newIsServing =
+    SERVING_UNITS.has(parsed.unit) || (parsed.unit === "" && oldIsServing);
+
+  let grams: number | null = null;
+  let servingCount: number | null = null;
+
+  if (newIsGram) {
+    grams = parsed.num; // she typed grams outright
+  } else if (newIsServing) {
+    servingCount = parsed.num;
+    const oldCount = old && old.num > 0 ? old.num : 1;
+    const gramsPerServing =
+      old && old.grams != null && oldCount > 0 ? old.grams / oldCount : null;
+    const countChanged = !old || parsed.num !== old.num;
+    if (countChanged && gramsPerServing != null) {
+      // She moved the serving count -> grams follow from the per-serving weight,
+      // ignoring the now-stale parenthetical.
+      grams = servingCount * gramsPerServing;
+    } else if (parsed.grams != null) {
+      // Count unchanged but she edited the "(… g)" -> that weight is authoritative.
+      grams = parsed.grams;
+    } else if (gramsPerServing != null) {
+      grams = servingCount * gramsPerServing;
+    }
+  } else if (parsed.grams != null) {
+    // A non-serving label that still carries a parenthetical gram weight.
+    grams = parsed.grams;
+  }
+
+  // --- Derive the macros by the best available basis. --------------------------
+  let macros: Macros | null = null;
+  if (grams != null && grams > 0 && entry.per100g) {
+    const f = grams / 100; // (a)
+    macros = {
+      calories: clampRound(entry.per100g.calories * f),
+      protein: clampRound(entry.per100g.protein * f),
+      carbs: clampRound(entry.per100g.carbs * f),
+      fat: clampRound(entry.per100g.fat * f),
+      fiber: clampRound((entry.per100g.fiber ?? 0) * f),
+    };
+  } else if (grams != null && grams > 0 && old?.grams && old.grams > 0) {
+    const r = grams / old.grams; // (b)
+    macros = {
+      calories: clampRound(entry.calories * r),
+      protein: clampRound(entry.protein * r),
+      carbs: clampRound(entry.carbs * r),
+      fat: clampRound(entry.fat * r),
+      fiber: clampRound((entry.fiber ?? 0) * r),
+    };
+  } else if (old && old.num > 0 && unitsMatch(old.unit, parsed.unit)) {
+    const r = parsed.num / old.num; // (c)
+    macros = {
+      calories: clampRound(entry.calories * r),
+      protein: clampRound(entry.protein * r),
+      carbs: clampRound(entry.carbs * r),
+      fat: clampRound(entry.fat * r),
+      fiber: clampRound((entry.fiber ?? 0) * r),
+    };
+  }
+
+  // (d) Can't derive — caller keeps the existing values.
+  if (!macros) return null;
+
+  // Normalize a serving label so its parenthetical grams tell the truth; leave
+  // any other label as she typed it.
+  const label =
+    servingCount != null && grams != null && grams > 0
+      ? servingLabel(servingCount, grams)
+      : newLabel.trim();
+
+  return { macros, label };
 }
 
 const FIELDS = "code,product_name,product_name_en,brands,serving_size,serving_quantity,nutriments";
